@@ -24,6 +24,7 @@
 
 #include <arm_neon.h>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -36,6 +37,199 @@ namespace fused {
 __attribute__((always_inline))
 static inline float32x4_t fused_sigmoid(float32x4_t x) {
     return openeva::prim::neon_sigmoid_tanh_pade(x);
+}
+
+// NEON in-place layernorm for DIM=12 / DIM=24, fp32 throughout.
+// Vendor's layernorm_ct uses fp64 reduction for bit-equivalent PyTorch CPU
+// numerics; we accept ~1e-5 per-call drift in exchange for ~30 ns/call
+// savings. Cumulative drift through the recurrence is bounded the same way
+// as the NEON sigmoid in ssla_neon_lru.h (cum drift ~ √N × per-call err).
+__attribute__((always_inline))
+static inline void neon_layernorm_12(float* __restrict__ y,
+                                      const float* __restrict__ gamma,
+                                      const float* __restrict__ beta) {
+    const float32x4_t v0 = vld1q_f32(y + 0);
+    const float32x4_t v1 = vld1q_f32(y + 4);
+    const float32x4_t v2 = vld1q_f32(y + 8);
+    const float32x4_t s  = vaddq_f32(vaddq_f32(v0, v1), v2);
+    const float mean = vaddvq_f32(s) * (1.0f / 12.0f);
+    const float32x4_t vmean = vdupq_n_f32(mean);
+    const float32x4_t c0 = vsubq_f32(v0, vmean);
+    const float32x4_t c1 = vsubq_f32(v1, vmean);
+    const float32x4_t c2 = vsubq_f32(v2, vmean);
+    float32x4_t sq = vmulq_f32(c0, c0);
+    sq = vfmaq_f32(sq, c1, c1);
+    sq = vfmaq_f32(sq, c2, c2);
+    const float var = vaddvq_f32(sq) * (1.0f / 12.0f);
+    const float inv = 1.0f / std::sqrt(var + 1e-5f);
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    vst1q_f32(y + 0, vfmaq_f32(vld1q_f32(beta + 0),
+                                vmulq_f32(c0, vinv), vld1q_f32(gamma + 0)));
+    vst1q_f32(y + 4, vfmaq_f32(vld1q_f32(beta + 4),
+                                vmulq_f32(c1, vinv), vld1q_f32(gamma + 4)));
+    vst1q_f32(y + 8, vfmaq_f32(vld1q_f32(beta + 8),
+                                vmulq_f32(c2, vinv), vld1q_f32(gamma + 8)));
+}
+
+__attribute__((always_inline))
+static inline void neon_layernorm_24(float* __restrict__ y,
+                                      const float* __restrict__ gamma,
+                                      const float* __restrict__ beta) {
+    const float32x4_t v0 = vld1q_f32(y +  0);
+    const float32x4_t v1 = vld1q_f32(y +  4);
+    const float32x4_t v2 = vld1q_f32(y +  8);
+    const float32x4_t v3 = vld1q_f32(y + 12);
+    const float32x4_t v4 = vld1q_f32(y + 16);
+    const float32x4_t v5 = vld1q_f32(y + 20);
+    const float32x4_t s = vaddq_f32(vaddq_f32(vaddq_f32(v0, v1), vaddq_f32(v2, v3)),
+                                     vaddq_f32(v4, v5));
+    const float mean = vaddvq_f32(s) * (1.0f / 24.0f);
+    const float32x4_t vmean = vdupq_n_f32(mean);
+    const float32x4_t c0 = vsubq_f32(v0, vmean);
+    const float32x4_t c1 = vsubq_f32(v1, vmean);
+    const float32x4_t c2 = vsubq_f32(v2, vmean);
+    const float32x4_t c3 = vsubq_f32(v3, vmean);
+    const float32x4_t c4 = vsubq_f32(v4, vmean);
+    const float32x4_t c5 = vsubq_f32(v5, vmean);
+    float32x4_t sq = vmulq_f32(c0, c0);
+    sq = vfmaq_f32(sq, c1, c1);
+    sq = vfmaq_f32(sq, c2, c2);
+    sq = vfmaq_f32(sq, c3, c3);
+    sq = vfmaq_f32(sq, c4, c4);
+    sq = vfmaq_f32(sq, c5, c5);
+    const float var = vaddvq_f32(sq) * (1.0f / 24.0f);
+    const float inv = 1.0f / std::sqrt(var + 1e-5f);
+    const float32x4_t vinv = vdupq_n_f32(inv);
+    vst1q_f32(y +  0, vfmaq_f32(vld1q_f32(beta +  0),
+                                 vmulq_f32(c0, vinv), vld1q_f32(gamma +  0)));
+    vst1q_f32(y +  4, vfmaq_f32(vld1q_f32(beta +  4),
+                                 vmulq_f32(c1, vinv), vld1q_f32(gamma +  4)));
+    vst1q_f32(y +  8, vfmaq_f32(vld1q_f32(beta +  8),
+                                 vmulq_f32(c2, vinv), vld1q_f32(gamma +  8)));
+    vst1q_f32(y + 12, vfmaq_f32(vld1q_f32(beta + 12),
+                                 vmulq_f32(c3, vinv), vld1q_f32(gamma + 12)));
+    vst1q_f32(y + 16, vfmaq_f32(vld1q_f32(beta + 16),
+                                 vmulq_f32(c4, vinv), vld1q_f32(gamma + 16)));
+    vst1q_f32(y + 20, vfmaq_f32(vld1q_f32(beta + 20),
+                                 vmulq_f32(c5, vinv), vld1q_f32(gamma + 20)));
+}
+
+// ============================================================================
+// One patch of <2, 12>: matvec_qvg<2, 36> + lru_step<12> + matvec_accum<12, 12>
+// Used by s0 L0. IN=2 → broadcast each input scalar; per-output cost dominated
+// by broadcast-fma rather than by inner reduce.
+// ============================================================================
+__attribute__((always_inline))
+static inline void patch_2_12(
+    const float32x4_t x0_bcast,   // = vdupq_n_f32(feat_in[0])
+    const float32x4_t x1_bcast,   // = vdupq_n_f32(feat_in[1])
+    const float* __restrict__ qvgW,         // (36, 2)
+    const float* __restrict__ goW,          // (12, 12)
+    float*       __restrict__ h_ptr,        // (12,)
+    float32x4_t& out0, float32x4_t& out1, float32x4_t& out2)
+{
+    // matvec_qvg<2, 36>: 36 outputs, 9 groups of 4. Per group: load w[4][2]
+    // (= 4 rows × 2 cols = 8 floats = 2 vec loads with deinterleave). Use
+    // broadcast pattern: y[4] = w[:, 0]*x0 + w[:, 1]*x1.
+    //
+    // Weight layout is row-major (36, 2). Rows are contiguous. To pull
+    // column 0 of 4 consecutive rows: w[og*4+0][0], w[og*4+1][0], …
+    // — strided. Use ld2 (interleaved load) to deinterleave columns.
+    float32x4_t qvg0, qvg1, qvg2, qvg3, qvg4, qvg5, qvg6, qvg7, qvg8;
+
+    #define MQV(og, sink) do {                                                 \
+        const float* w = qvgW + (og) * 4 * 2;                                  \
+        const float32x4x2_t W2 = vld2q_f32(w);                                 \
+        float32x4_t a = vmulq_f32(W2.val[0], x0_bcast);                        \
+        a = vfmaq_f32(a, W2.val[1], x1_bcast);                                 \
+        (sink) = a;                                                            \
+    } while (0)
+    MQV(0, qvg0); MQV(1, qvg1); MQV(2, qvg2);
+    MQV(3, qvg3); MQV(4, qvg4); MQV(5, qvg5);
+    MQV(6, qvg6); MQV(7, qvg7); MQV(8, qvg8);
+    #undef MQV
+
+    // qvg layout (36 outputs row-major): q[0..11], v[0..11], g[0..11]
+    // → q = qvg0..qvg2, v = qvg3..qvg5, g = qvg6..qvg8
+    float32x4_t qh0, qh1, qh2;
+    #define LRU(b, qv, vv, gv, qhv) do {                                       \
+        const float32x4_t gc = fused_sigmoid(gv);                              \
+        const float32x4_t hc = vfmaq_f32(vv, gc, vld1q_f32(h_ptr + (b) * 4));  \
+        vst1q_f32(h_ptr + (b) * 4, hc);                                        \
+        (qhv) = vmulq_f32(qv, hc);                                             \
+    } while (0)
+    LRU(0, qvg0, qvg3, qvg6, qh0);
+    LRU(1, qvg1, qvg4, qvg7, qh1);
+    LRU(2, qvg2, qvg5, qvg8, qh2);
+    #undef LRU
+
+    // matvec_accum<12, 12>: 3 output groups of 4, across-IN axis.
+    #define MAC(og, outx) do {                                                 \
+        const float* w0 = goW + ((og)*4 + 0) * 12;                             \
+        const float* w1 = goW + ((og)*4 + 1) * 12;                             \
+        const float* w2 = goW + ((og)*4 + 2) * 12;                             \
+        const float* w3 = goW + ((og)*4 + 3) * 12;                             \
+        float32x4_t a0 = vmulq_f32(qh0, vld1q_f32(w0 + 0));                    \
+        float32x4_t a1 = vmulq_f32(qh0, vld1q_f32(w1 + 0));                    \
+        float32x4_t a2 = vmulq_f32(qh0, vld1q_f32(w2 + 0));                    \
+        float32x4_t a3 = vmulq_f32(qh0, vld1q_f32(w3 + 0));                    \
+        a0 = vfmaq_f32(a0, qh1, vld1q_f32(w0 + 4));                            \
+        a1 = vfmaq_f32(a1, qh1, vld1q_f32(w1 + 4));                            \
+        a2 = vfmaq_f32(a2, qh1, vld1q_f32(w2 + 4));                            \
+        a3 = vfmaq_f32(a3, qh1, vld1q_f32(w3 + 4));                            \
+        a0 = vfmaq_f32(a0, qh2, vld1q_f32(w0 + 8));                            \
+        a1 = vfmaq_f32(a1, qh2, vld1q_f32(w1 + 8));                            \
+        a2 = vfmaq_f32(a2, qh2, vld1q_f32(w2 + 8));                            \
+        a3 = vfmaq_f32(a3, qh2, vld1q_f32(w3 + 8));                            \
+        const float32x4_t s01 = vpaddq_f32(a0, a1);                            \
+        const float32x4_t s23 = vpaddq_f32(a2, a3);                            \
+        (outx) = vaddq_f32((outx), vpaddq_f32(s01, s23));                      \
+    } while (0)
+    MAC(0, out0); MAC(1, out1); MAC(2, out2);
+    #undef MAC
+}
+
+// s0 L0 = <2, 12>. Has input_proj (IN != OUT). feat_in is only 2 floats.
+// **NUM_POS = 1** for stage-0 L0 (K=1, single-cell update — unlike all the
+// later layers which are K=3, 9-patch). Caller passes only qvgIn[0] / goW[0].
+static inline void s0_l0_interior(
+    int ev_x, int ev_y, int Wl,
+    const float* __restrict__ feat_in,        // (2,)
+    const float* __restrict__ input_proj,     // (12, 2)
+    const float* __restrict__ qvgIn0,         // (36, 2) — qvgIn[0] only
+    const float* __restrict__ goW0,           // (12, 12) — goW[0] only
+    const float* __restrict__ ln_gamma,
+    const float* __restrict__ ln_beta,
+    float*       __restrict__ H_all,
+    float*       __restrict__ feat_out)        // (12,)
+{
+    const float32x4_t x0b = vdupq_n_f32(feat_in[0]);
+    const float32x4_t x1b = vdupq_n_f32(feat_in[1]);
+
+    // Residual: out = input_proj @ feat_in  (12 outputs from 2 inputs).
+    // 3 output groups of 4. ld2 + broadcast pattern.
+    float32x4_t out0, out1, out2;
+    #define RES(og, outx) do {                                                 \
+        const float* w = input_proj + (og) * 4 * 2;                            \
+        const float32x4x2_t W2 = vld2q_f32(w);                                 \
+        float32x4_t a = vmulq_f32(W2.val[0], x0b);                             \
+        a = vfmaq_f32(a, W2.val[1], x1b);                                      \
+        (outx) = a;                                                            \
+    } while (0)
+    RES(0, out0); RES(1, out1); RES(2, out2);
+    #undef RES
+
+    // Single patch (num_pos = 1). pos = 0, patch_idx = base = ev_y*Wl + ev_x.
+    const int patch_idx = ev_y * Wl + ev_x;
+    patch_2_12(x0b, x1b,
+               qvgIn0, goW0,
+               H_all + (std::ptrdiff_t)patch_idx * 12,
+               out0, out1, out2);
+
+    vst1q_f32(feat_out + 0, out0);
+    vst1q_f32(feat_out + 4, out1);
+    vst1q_f32(feat_out + 8, out2);
+    openeva::prim::layernorm_ct<12>(feat_out, ln_gamma, ln_beta);
 }
 
 // ============================================================================
@@ -151,12 +345,12 @@ static inline void s0_l1_interior(
     out1 = vaddq_f32(out1, x1);
     out2 = vaddq_f32(out2, x2);
 
-    alignas(16) float tmp[12];
-    vst1q_f32(tmp + 0, out0);
-    vst1q_f32(tmp + 4, out1);
-    vst1q_f32(tmp + 8, out2);
-    openeva::prim::layernorm_ct<12>(tmp, ln_gamma, ln_beta);
-    std::memcpy(feat_out, tmp, sizeof(float) * 12);
+    // Direct write into feat_out (caller-supplied, 16-aligned per
+    // std::vector<float> guarantee). LN works in-place — no tmp+memcpy.
+    vst1q_f32(feat_out + 0, out0);
+    vst1q_f32(feat_out + 4, out1);
+    vst1q_f32(feat_out + 8, out2);
+    openeva::prim::layernorm_ct<12>(feat_out, ln_gamma, ln_beta);
 }
 
 // ============================================================================
@@ -205,20 +399,32 @@ static inline void patch_12_24(
     MQV(15, qvg15); MQV(16, qvg16); MQV(17, qvg17);
     #undef MQV
 
-    float32x4_t qh0, qh1, qh2, qh3, qh4, qh5;
-    #define LRU(b, qv, vv, gv, qhv) do {                                       \
-        const float32x4_t gc = fused_sigmoid(gv);                              \
-        const float32x4_t hc = vfmaq_f32(vv, gc, vld1q_f32(h_ptr + (b) * 4));  \
-        vst1q_f32(h_ptr + (b) * 4, hc);                                        \
-        (qhv) = vmulq_f32(qv, hc);                                             \
-    } while (0)
-    LRU(0, qvg0,  qvg6,  qvg12, qh0);
-    LRU(1, qvg1,  qvg7,  qvg13, qh1);
-    LRU(2, qvg2,  qvg8,  qvg14, qh2);
-    LRU(3, qvg3,  qvg9,  qvg15, qh3);
-    LRU(4, qvg4,  qvg10, qvg16, qh4);
-    LRU(5, qvg5,  qvg11, qvg17, qh5);
-    #undef LRU
+    // LRU two-phase (see patch_24_24 comment).
+    const float32x4_t gc0 = fused_sigmoid(qvg12);
+    const float32x4_t gc1 = fused_sigmoid(qvg13);
+    const float32x4_t gc2 = fused_sigmoid(qvg14);
+    const float32x4_t gc3 = fused_sigmoid(qvg15);
+    const float32x4_t gc4 = fused_sigmoid(qvg16);
+    const float32x4_t gc5 = fused_sigmoid(qvg17);
+
+    const float32x4_t hc0 = vfmaq_f32(qvg6,  gc0, vld1q_f32(h_ptr +  0));
+    const float32x4_t hc1 = vfmaq_f32(qvg7,  gc1, vld1q_f32(h_ptr +  4));
+    const float32x4_t hc2 = vfmaq_f32(qvg8,  gc2, vld1q_f32(h_ptr +  8));
+    const float32x4_t hc3 = vfmaq_f32(qvg9,  gc3, vld1q_f32(h_ptr + 12));
+    const float32x4_t hc4 = vfmaq_f32(qvg10, gc4, vld1q_f32(h_ptr + 16));
+    const float32x4_t hc5 = vfmaq_f32(qvg11, gc5, vld1q_f32(h_ptr + 20));
+    vst1q_f32(h_ptr +  0, hc0);
+    vst1q_f32(h_ptr +  4, hc1);
+    vst1q_f32(h_ptr +  8, hc2);
+    vst1q_f32(h_ptr + 12, hc3);
+    vst1q_f32(h_ptr + 16, hc4);
+    vst1q_f32(h_ptr + 20, hc5);
+    const float32x4_t qh0 = vmulq_f32(qvg0, hc0);
+    const float32x4_t qh1 = vmulq_f32(qvg1, hc1);
+    const float32x4_t qh2 = vmulq_f32(qvg2, hc2);
+    const float32x4_t qh3 = vmulq_f32(qvg3, hc3);
+    const float32x4_t qh4 = vmulq_f32(qvg4, hc4);
+    const float32x4_t qh5 = vmulq_f32(qvg5, hc5);
 
     #define MAC(og, outx) do {                                                 \
         const float* w0 = goW + ((og)*4 + 0) * 24;                             \
@@ -313,15 +519,13 @@ static inline void s1_l0_interior(
                     out0, out1, out2, out3, out4, out5);
     }
 
-    alignas(16) float tmp[24];
-    vst1q_f32(tmp +  0, out0);
-    vst1q_f32(tmp +  4, out1);
-    vst1q_f32(tmp +  8, out2);
-    vst1q_f32(tmp + 12, out3);
-    vst1q_f32(tmp + 16, out4);
-    vst1q_f32(tmp + 20, out5);
-    openeva::prim::layernorm_ct<24>(tmp, ln_gamma, ln_beta);
-    std::memcpy(feat_out, tmp, sizeof(float) * 24);
+    vst1q_f32(feat_out +  0, out0);
+    vst1q_f32(feat_out +  4, out1);
+    vst1q_f32(feat_out +  8, out2);
+    vst1q_f32(feat_out + 12, out3);
+    vst1q_f32(feat_out + 16, out4);
+    vst1q_f32(feat_out + 20, out5);
+    openeva::prim::layernorm_ct<24>(feat_out, ln_gamma, ln_beta);
 }
 
 // ============================================================================
@@ -383,20 +587,35 @@ static inline void patch_24_24(
     MQV(15, qvg15); MQV(16, qvg16); MQV(17, qvg17);
     #undef MQV
 
-    float32x4_t qh0, qh1, qh2, qh3, qh4, qh5;
-    #define LRU(b, qv, vv, gv, qhv) do {                                       \
-        const float32x4_t gc = fused_sigmoid(gv);                              \
-        const float32x4_t hc = vfmaq_f32(vv, gc, vld1q_f32(h_ptr + (b) * 4));  \
-        vst1q_f32(h_ptr + (b) * 4, hc);                                        \
-        (qhv) = vmulq_f32(qv, hc);                                             \
-    } while (0)
-    LRU(0, qvg0,  qvg6,  qvg12, qh0);
-    LRU(1, qvg1,  qvg7,  qvg13, qh1);
-    LRU(2, qvg2,  qvg8,  qvg14, qh2);
-    LRU(3, qvg3,  qvg9,  qvg15, qh3);
-    LRU(4, qvg4,  qvg10, qvg16, qh4);
-    LRU(5, qvg5,  qvg11, qvg17, qh5);
-    #undef LRU
+    // LRU two-phase: all 6 sigmoids issued together (independent vdiv chains
+    // pipeline on A78AE's FP pipes), then fmadd+store+mul as a second pass.
+    // Forces compiler to schedule the 6 sigmoid latencies in parallel rather
+    // than chunk-by-chunk sequential.
+    const float32x4_t gc0 = fused_sigmoid(qvg12);
+    const float32x4_t gc1 = fused_sigmoid(qvg13);
+    const float32x4_t gc2 = fused_sigmoid(qvg14);
+    const float32x4_t gc3 = fused_sigmoid(qvg15);
+    const float32x4_t gc4 = fused_sigmoid(qvg16);
+    const float32x4_t gc5 = fused_sigmoid(qvg17);
+
+    const float32x4_t hc0 = vfmaq_f32(qvg6,  gc0, vld1q_f32(h_ptr +  0));
+    const float32x4_t hc1 = vfmaq_f32(qvg7,  gc1, vld1q_f32(h_ptr +  4));
+    const float32x4_t hc2 = vfmaq_f32(qvg8,  gc2, vld1q_f32(h_ptr +  8));
+    const float32x4_t hc3 = vfmaq_f32(qvg9,  gc3, vld1q_f32(h_ptr + 12));
+    const float32x4_t hc4 = vfmaq_f32(qvg10, gc4, vld1q_f32(h_ptr + 16));
+    const float32x4_t hc5 = vfmaq_f32(qvg11, gc5, vld1q_f32(h_ptr + 20));
+    vst1q_f32(h_ptr +  0, hc0);
+    vst1q_f32(h_ptr +  4, hc1);
+    vst1q_f32(h_ptr +  8, hc2);
+    vst1q_f32(h_ptr + 12, hc3);
+    vst1q_f32(h_ptr + 16, hc4);
+    vst1q_f32(h_ptr + 20, hc5);
+    const float32x4_t qh0 = vmulq_f32(qvg0, hc0);
+    const float32x4_t qh1 = vmulq_f32(qvg1, hc1);
+    const float32x4_t qh2 = vmulq_f32(qvg2, hc2);
+    const float32x4_t qh3 = vmulq_f32(qvg3, hc3);
+    const float32x4_t qh4 = vmulq_f32(qvg4, hc4);
+    const float32x4_t qh5 = vmulq_f32(qvg5, hc5);
 
     #define MAC(og, outx) do {                                                 \
         const float* w0 = goW + ((og)*4 + 0) * 24;                             \
@@ -482,15 +701,13 @@ static inline void s1_l1_interior(
     out4 = vaddq_f32(out4, x4);
     out5 = vaddq_f32(out5, x5);
 
-    alignas(16) float tmp[24];
-    vst1q_f32(tmp +  0, out0);
-    vst1q_f32(tmp +  4, out1);
-    vst1q_f32(tmp +  8, out2);
-    vst1q_f32(tmp + 12, out3);
-    vst1q_f32(tmp + 16, out4);
-    vst1q_f32(tmp + 20, out5);
-    openeva::prim::layernorm_ct<24>(tmp, ln_gamma, ln_beta);
-    std::memcpy(feat_out, tmp, sizeof(float) * 24);
+    vst1q_f32(feat_out +  0, out0);
+    vst1q_f32(feat_out +  4, out1);
+    vst1q_f32(feat_out +  8, out2);
+    vst1q_f32(feat_out + 12, out3);
+    vst1q_f32(feat_out + 16, out4);
+    vst1q_f32(feat_out + 20, out5);
+    openeva::prim::layernorm_ct<24>(feat_out, ln_gamma, ln_beta);
 }
 
 }  // namespace fused

@@ -737,9 +737,18 @@ void SslaSPipeline::stage_forward(int stage, int ev_x, int ev_y,
                        && (ev_y > 0) && (ev_y + 1 < Hl);
     switch (stage) {
         case 0:
-            layer_forward_ct<kInDim, kC0>(0, ev_x, ev_y, feat_in, tmp);
-            // s0 L1: fused interior path (1.09× over generic in microbench).
             if (interior) {
+                // s0 L0: fused interior path. num_pos = 1 (K=1, single-cell
+                // update — only qvgIn[0] / goW[0] are populated). Skips
+                // add_macs TLS counter — the dominant TLS-write source.
+                const auto& L0 = layers_[0];
+                fused::s0_l0_interior(
+                    ev_x, ev_y, Wl, feat_in,
+                    L0.input_proj.empty() ? nullptr : L0.input_proj.data(),
+                    L0.qvgIn[0].data(), L0.goW[0].data(),
+                    L0.ln_gamma.data(), L0.ln_beta.data(),
+                    hidden_[0].data(), tmp);
+                // s0 L1: fused interior path (1.09× over generic in microbench).
                 const auto& L1 = layers_[1];
                 fused::s0_l1_interior(
                     ev_x, ev_y, Wl, tmp,
@@ -747,6 +756,7 @@ void SslaSPipeline::stage_forward(int stage, int ev_x, int ev_y,
                     L1.ln_gamma.data(), L1.ln_beta.data(),
                     hidden_[1].data(), feat_out);
             } else {
+                layer_forward_ct<kInDim, kC0>(0, ev_x, ev_y, feat_in, tmp);
                 layer_forward_ct<kC0, kC0>(1, ev_x, ev_y, tmp, feat_out);
             }
             break;
