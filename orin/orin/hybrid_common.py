@@ -33,8 +33,9 @@ INPUT_DTYPE = np.dtype([
     ("x",        "<u2"),
     ("y",        "<u2"),
     ("feat1",    "<f4", (C1,)),
+    ("t_push_ns", "<u8"),
 ])
-assert INPUT_DTYPE.itemsize == 112, INPUT_DTYPE.itemsize
+assert INPUT_DTYPE.itemsize == 120, INPUT_DTYPE.itemsize
 
 OUTPUT_DTYPE = np.dtype([
     ("pass2",   "<i4"),
@@ -82,6 +83,12 @@ class CHybridS2S3Config(ctypes.Structure):
         ("timing",       ctypes.c_uint64 * 2),
         ("timing_mask",  ctypes.c_uint32),
         ("_pad_timing",  ctypes.c_uint32),  # explicit, keep struct 8-byte aligned
+        # Per-block calibration: kernel writes clock64() at entry into
+        # *kernel_start_clk[blk] and at exit (stop-flag observed) into
+        # *kernel_end_clk[blk]. The host pairs each with its
+        # CLOCK_MONOTONIC_RAW reading at the corresponding moment.
+        ("kernel_start_clk", ctypes.c_uint64 * 2),
+        ("kernel_end_clk",   ctypes.c_uint64 * 2),
     ]
 
 
@@ -91,8 +98,9 @@ TIMING_DTYPE = np.dtype([
     ("t_done_clk", "<u8"),
     ("seq",        "<u4"),
     ("owner",      "<u4"),
+    ("t_push_ns",  "<u8"),
 ])
-assert TIMING_DTYPE.itemsize == 24
+assert TIMING_DTYPE.itemsize == 32
 
 
 HEAD_OUT_DEFAULT = 7    # 5 box + 2 cls (Gen1)
@@ -192,6 +200,8 @@ def build_config(H2: int, W2: int, H3: int, W3: int, tdrop_window: int,
                   version: Tuple[int, int] = (0, 0),
                   timing: Tuple[int, int] = (0, 0),
                   timing_mask: int = 0,
+                  kernel_start_clk: Tuple[int, int] = (0, 0),
+                  kernel_end_clk:   Tuple[int, int] = (0, 0),
                   ) -> Tuple[int, ctypes.Array]:
     """Build CHybridS2S3Config in managed memory; return (devptr, keepalive).
 
@@ -227,6 +237,10 @@ def build_config(H2: int, W2: int, H3: int, W3: int, tdrop_window: int,
     cfg.timing[0]  = timing[0]
     cfg.timing[1]  = timing[1]
     cfg.timing_mask = timing_mask
+    cfg.kernel_start_clk[0] = kernel_start_clk[0]
+    cfg.kernel_start_clk[1] = kernel_start_clk[1]
+    cfg.kernel_end_clk[0]   = kernel_end_clk[0]
+    cfg.kernel_end_clk[1]   = kernel_end_clk[1]
     p_cfg, cfg_ka = cuda_util.alloc_managed(ctypes.sizeof(CHybridS2S3Config))
     ctypes.memmove(p_cfg, ctypes.addressof(cfg), ctypes.sizeof(CHybridS2S3Config))
     return p_cfg, cfg_ka
@@ -248,6 +262,27 @@ def alloc_timing(capacity_pow2: int):
         devs.append(p)
         views.append(np.frombuffer(ka, dtype=TIMING_DTYPE).reshape(-1))
     return devs, views, capacity_pow2 - 1, kas
+
+
+def alloc_kernel_start_clk():
+    """Per-block uint64 slot the kernel writes once at entry (SM clock cycles).
+    Host reads after launch + small spin to obtain the (CPU_ns ↔ SM_cycles)
+    calibration anchor.
+
+    MUST be pinned host memory (not managed) because the CPU spin-polls this
+    while the persistent kernel is running, and Orin reports
+    CONCURRENT_MANAGED_ACCESS=0 — concurrent CPU/GPU access to managed memory
+    is UB on Tegra. See CLAUDE.md §2.1.
+
+    Returns (devs[2], views[2], keepalive)."""
+    devs, views, kas = [], [], []
+    for _ in range(N_BLOCKS):
+        p, ka = cuda_util.alloc_pinned(8)
+        ctypes.memset(p, 0, 8)
+        kas.append(ka)
+        devs.append(p)
+        views.append(np.frombuffer(ka, dtype=np.uint64).reshape(1))
+    return devs, views, kas
 
 
 def build_head_weights(rng: np.random.Generator, head_out_dim: int = HEAD_OUT_DEFAULT):

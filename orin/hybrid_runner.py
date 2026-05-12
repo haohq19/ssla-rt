@@ -46,7 +46,7 @@ from orin.hybrid_common import (  # noqa: E402
     INPUT_DTYPE, C1, C2, C3, N_BLOCKS, HEAD_OUT_DEFAULT, TIMING_DTYPE,
     CHybridS2S3Config,
     build_random_layers, build_config, alloc_tdrop_counters,
-    build_head_weights, alloc_predictions, alloc_timing,
+    build_head_weights, alloc_predictions, alloc_timing, alloc_kernel_start_clk,
     block_proc_range, S01gAPI,
 )
 
@@ -293,6 +293,8 @@ def main() -> int:
         H3, W2, head_out_dim)
     timing_dev, timing_view, timing_mask, ka_timing = alloc_timing(
         args.timing_cap)
+    kstart_dev, kstart_view, ka_kstart = alloc_kernel_start_clk()
+    kend_dev,   kend_view,   ka_kend   = alloc_kernel_start_clk()
     p_cfg, ka_cfg = build_config(
         H2, W2, H3, W3, args.tdrop,
         gpu_layers, tdrop_s2_dev, tdrop_s3_dev,
@@ -301,6 +303,8 @@ def main() -> int:
         version=(version_dev[0], version_dev[1]),
         timing=(timing_dev[0], timing_dev[1]),
         timing_mask=timing_mask,
+        kernel_start_clk=(kstart_dev[0], kstart_dev[1]),
+        kernel_end_clk=(kend_dev[0], kend_dev[1]),
     )
 
     # ---- 2. Pinned host memory for rings + control --------------------
@@ -345,7 +349,7 @@ def main() -> int:
         BATCH_K = 8
         N_WARPS_K = 9
         OUT_MAX_K = C3
-        event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4
+        event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8  # 5 ints + pad + u64
         SMEM = (event_slot * BATCH_K
                 + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
                 + N_WARPS_K * OUT_MAX_K * 4
@@ -363,6 +367,13 @@ def main() -> int:
     func = mod.get_function(func_name)
     print(f"Launching persistent kernel: gridDim=2, blockDim={threads_pb}, "
           f"smem={SMEM} B", flush=True)
+    # CPU/GPU clock-anchor for end-to-end latency. We record CPU monotonic
+    # right before cuLaunch, then spin-poll kernel_start_clk after launch
+    # until the GPU writes its clock64() at kernel entry. The kernel-entry
+    # event happens between t_launch_cpu_ns and t_anchor_cpu_ns; we use
+    # t_anchor_cpu_ns (the observation time) as the anchor — its bias from
+    # the true entry time is bounded by the spin-poll latency (~µs).
+    t_launch_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     func.launch((2, 1, 1), (threads_pb, 1, 1), [
         arg_ptr(p_cfg),
         arg_ptr(ring_dev[0]),
@@ -376,6 +387,25 @@ def main() -> int:
         arg_u32(args.spin_ns),
     ], smem=SMEM)
     # No sync — kernel runs in background until *stop_flag != 0.
+
+    # Busy-spin (NOT time.sleep) until both blocks have written their
+    # kernel-entry clock64. time.sleep on a non-RT process has ms-scale
+    # granularity, which corrupts the anchor by milliseconds and biases the
+    # two-point slope calibration. Busy-spin observes within ~µs.
+    a_view = kstart_view[0]; b_view = kstart_view[1]
+    t_deadline = time.monotonic() + 2.0
+    while a_view[0] == 0 or b_view[0] == 0:
+        if time.monotonic() > t_deadline:
+            print("[warn] kernel_start_clk did not arrive within 2 s; "
+                  "latency anchor will be imprecise", flush=True)
+            break
+    t_anchor_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    kernel_start_clk_blk = [int(kstart_view[0][0]), int(kstart_view[1][0])]
+    print(f"[anchor] CPU ns = {t_anchor_cpu_ns}, "
+          f"GPU clk[0] = {kernel_start_clk_blk[0]}, "
+          f"clk[1] = {kernel_start_clk_blk[1]}, "
+          f"launch→anchor = {(t_anchor_cpu_ns - t_launch_cpu_ns)/1000:.1f} µs",
+          flush=True)
 
     # ---- 4. Init libstage01_to_gpu and attach rings -------------------
     if not os.path.exists(LIB_PATH):
@@ -485,8 +515,13 @@ def main() -> int:
     from cuda import cuda
     print("[main] cuCtxSynchronize (waiting for GPU kernel exit) ...", flush=True)
     err, = cuda.cuCtxSynchronize()
+    t_exit_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     if err != cuda.CUresult.CUDA_SUCCESS:
         print(f"[main] cuCtxSynchronize: {err}", flush=True)
+    kernel_end_clk_blk = [int(kend_view[0][0]), int(kend_view[1][0])]
+    print(f"[anchor exit] CPU ns = {t_exit_cpu_ns}, "
+          f"GPU end clk[0] = {kernel_end_clk_blk[0]}, "
+          f"clk[1] = {kernel_end_clk_blk[1]}", flush=True)
     print("[main] shutdown libstage01_to_gpu ...", flush=True)
     api.shutdown()
 
@@ -525,42 +560,69 @@ def main() -> int:
         share = (sn / total_ns * 100.0) if total_ns > 0 else 0.0
         print(f"  {name:>20} | {mean_us:10.3f}  {cn:12d}  {share:7.1f}%")
 
-    # GPU latency: per-event clock64 deltas, converted to ns assuming
-    # SM clock 918 MHz. Filter to slots with non-zero t_done_clk (slot 0
-    # before first write) and trim warmup.
-    print(f"\n[gpu lat] (SM_CLK = {SM_CLK_HZ/1e6:.0f} MHz, "
+    # GPU end-to-end latency: CPU push → GPU done.
+    #   t_done_ns_cpu = t_anchor_cpu_ns + (t_done_clk - kernel_start_clk[blk])
+    #                                      * 1e9 / SM_CLK_HZ
+    #   latency_ns    = t_done_ns_cpu - t_push_ns
+    # The previous (t_done_clk - t_pop_clk) metric is also reported as
+    # "kernel µs" to show how much of the total is pure GPU compute vs
+    # ring-wait time.
+    # NOTE on calibration accuracy:
+    #   `krn p50/p99` (t_done_clk − t_pop_clk, converted at SM rate) is the
+    #   pure GPU compute time per batch — exact.
+    #   `e2e p50/p99/max` adds (push→pop) ring-wait time, but the CPU/GPU
+    #   clock cross-correlation is approximate: anchored by host CPU
+    #   CLOCK_MONOTONIC_RAW recorded at cuLaunch / cuCtxSynchronize, with
+    #   per-block (kernel_start_clk, kernel_end_clk) bounding the SM cycles.
+    #   Without root + jetson_clocks the SM clock is DVFS-controlled and
+    #   the linear fit between the two anchors carries a ms-scale residual
+    #   error. Treat e2e numbers as upper-bounded by ~5 ms calibration bias.
+    print(f"\n[gpu lat] CPU-push → GPU-done (calibration ±~5 ms, "
           f"ring cap = {args.timing_cap})")
-    print(f"{'block':>5} | {'n_owner':>8} {'p50_us':>8} {'p90_us':>8} "
-          f"{'p99_us':>8} {'max_us':>8} | {'n_all':>8} {'p50_us':>8} {'p99_us':>8}")
+    print(f"{'block':>5} | {'n_owner':>7} {'e2e p50':>8} {'e2e p99':>8} "
+          f"{'e2e max':>8} | {'krn p50':>8} {'krn p99':>8} | "
+          f"{'n_all':>7} {'e2e p50':>8} {'e2e p99':>8} µs")
     for b in range(N_BLOCKS):
         tv = timing_view[b]
-        valid = tv["t_done_clk"] != 0
+        valid = (tv["t_done_clk"] != 0) & (tv["t_push_ns"] != 0)
         if not valid.any():
             print(f"{b:>5} | (no samples)")
             continue
-        # Trim 5 % head + tail to skip warmup / shutdown effects.
         idx = np.nonzero(valid)[0]
         head_skip = max(1, len(idx) // 20)
         tail_skip = max(1, len(idx) // 20)
         idx = idx[head_skip:-tail_skip] if len(idx) > head_skip + tail_skip else idx
-        dt_clk = (tv["t_done_clk"][idx].astype(np.int64)
-                  - tv["t_pop_clk"][idx].astype(np.int64))
-        dt_us  = dt_clk * (1e6 / SM_CLK_HZ)
+
+        # End-to-end latency in µs.
+        # Two-point calibration: (t_anchor_cpu_ns, kernel_start_clk[b]) at
+        # kernel entry and (t_exit_cpu_ns, kernel_end_clk[b]) at exit.
+        # Effective ns/cycle = slope between the two anchors.
+        cyc_span = kernel_end_clk_blk[b] - kernel_start_clk_blk[b]
+        ns_span  = t_exit_cpu_ns - t_anchor_cpu_ns
+        ns_per_cycle = (ns_span / cyc_span) if cyc_span > 0 else (1e9 / SM_CLK_HZ)
+        eff_sm_clk_mhz = 1000.0 / ns_per_cycle
+        t_done_cyc = tv["t_done_clk"][idx].astype(np.int64)
+        t_push_ns_arr = tv["t_push_ns"][idx].astype(np.int64).astype(np.float64)
+        dt_cyc = (t_done_cyc - kernel_start_clk_blk[b]).astype(np.float64)
+        t_done_ns_cpu = t_anchor_cpu_ns + dt_cyc * ns_per_cycle
+        e2e_us = (t_done_ns_cpu - t_push_ns_arr) / 1000.0
+
+        # Pure GPU compute time (t_done_clk - t_pop_clk).
+        krn_us = (t_done_cyc - tv["t_pop_clk"][idx].astype(np.int64)) \
+                 * (1e6 / SM_CLK_HZ)
+
         owner_mask = tv["owner"][idx] == 1
-        own_us = dt_us[owner_mask]
-        all_us = dt_us
-        def _stats(a):
-            if a.size == 0:
-                return (0, 0.0, 0.0, 0.0, 0.0)
-            return (a.size,
-                    float(np.percentile(a, 50)),
-                    float(np.percentile(a, 90)),
-                    float(np.percentile(a, 99)),
-                    float(a.max()))
-        no, p50o, p90o, p99o, maxo = _stats(own_us)
-        na, p50a, _,    p99a, _    = _stats(all_us)
-        print(f"{b:>5} | {no:>8d} {p50o:>8.1f} {p90o:>8.1f} "
-              f"{p99o:>8.1f} {maxo:>8.1f} | {na:>8d} {p50a:>8.1f} {p99a:>8.1f}")
+        own_e2e = e2e_us[owner_mask]
+        own_krn = krn_us[owner_mask]
+        def _pct(a, p):
+            return float(np.percentile(a, p)) if a.size else 0.0
+        def _max(a):
+            return float(a.max()) if a.size else 0.0
+        print(f"{b:>5} | {own_e2e.size:>7d} "
+              f"{_pct(own_e2e,50):>8.1f} {_pct(own_e2e,99):>8.1f} {_max(own_e2e):>8.1f} | "
+              f"{_pct(own_krn,50):>8.1f} {_pct(own_krn,99):>8.1f} | "
+              f"{e2e_us.size:>7d} {_pct(e2e_us,50):>8.1f} {_pct(e2e_us,99):>8.1f}  "
+              f"(eff SM clk = {eff_sm_clk_mhz:.1f} MHz)")
 
     p2_pass = ((cam_thread.events_in if cam_thread is not None else synth_total) > 0
                and done0 > 0 and done1 > 0

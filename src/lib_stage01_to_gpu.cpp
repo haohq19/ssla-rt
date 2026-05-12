@@ -30,6 +30,7 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <time.h>
 #endif
 
 #include "openeva/event.h"
@@ -43,15 +44,31 @@ namespace {
 
 constexpr int N_GPU_BLOCKS = 2;
 
-// Must match HybridInputRec in ssla_s2_s3_head.cuh (112 bytes).
+// Must match HybridInputRec in ssla_s2_s3_head.cuh (120 bytes).
 struct HybridInputRec {
     std::uint64_t  seq_done;
     float          t;
     std::uint16_t  x;
     std::uint16_t  y;
     float          feat1[24];   // C1 = 24
+    std::uint64_t  t_push_ns;   // CPU CLOCK_MONOTONIC_RAW ns at ring publish
 };
-static_assert(sizeof(HybridInputRec) == 112, "HybridInputRec layout drift");
+static_assert(sizeof(HybridInputRec) == 120, "HybridInputRec layout drift");
+
+// Wallclock at ring-publish moment, used as the per-event arrival timestamp.
+// Same clock domain (CLOCK_MONOTONIC_RAW) used to calibrate the GPU SM-clock
+// offset at kernel-launch time, so latency = t_done_ns - t_push_ns is well
+// defined across CPU/GPU.
+static inline std::uint64_t mono_raw_ns() {
+#if defined(__linux__)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull
+         + static_cast<std::uint64_t>(ts.tv_nsec);
+#else
+    return 0ull;
+#endif
+}
 
 void pin_to_core(int core_id) {
 #if defined(__linux__)
@@ -239,8 +256,13 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
                         dst->y = static_cast<std::uint16_t>(s2y);
                         std::memcpy(dst->feat1, feat1.data(),
                                     sizeof(float) * 24);
+                        // Stamp arrival time immediately before publish so
+                        // latency = (GPU done time) - t_push_ns captures the
+                        // full ring-wait + GPU compute window.
+                        dst->t_push_ns = mono_raw_ns();
                         // Release-store seq_done; ensures record fields
-                        // visible before consumer observes the tag.
+                        // (including t_push_ns) are visible before consumer
+                        // observes the tag.
                         __atomic_store_n(&dst->seq_done, slot + 1ull,
                                           __ATOMIC_RELEASE);
                         gb.n_pushed.fetch_add(1, std::memory_order_relaxed);

@@ -54,6 +54,7 @@ struct GpuTimingSlot {
     unsigned long long t_done_clk;
     unsigned int       seq;     // event seq (logical pop position)
     unsigned int       owner;   // 1 if owner-pass-3 reached head; 0 otherwise
+    unsigned long long t_push_ns;   // copied from HybridInputRec at process time
 };
 
 // Shared config readable by both blocks.
@@ -82,6 +83,10 @@ struct HybridS2S3Config {
     // GPU timing — NULL = disabled. timing_mask = capacity − 1.
     GpuTimingSlot*   timing[2];
     unsigned int     timing_mask;
+    unsigned int     _pad_timing;
+    // Per-block calibration: see ssla_s2_s3_head_celled.cuh for details.
+    unsigned long long* kernel_start_clk[2];
+    unsigned long long* kernel_end_clk[2];
 };
 
 // Per-event input record (CPU pushes; GPU pops). 112 bytes.
@@ -103,6 +108,7 @@ struct HybridInputRec {
     unsigned short     x;            // s2-res x
     unsigned short     y;            // s2-res y
     float              feat1[24];    // C1 = 24 features post-CPU-stage-1
+    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at ring publish
 };
 
 // Per-event debug output (P1 diff). The kernel writes it for both

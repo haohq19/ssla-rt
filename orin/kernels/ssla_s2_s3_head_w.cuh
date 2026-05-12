@@ -54,6 +54,7 @@ struct GpuTimingSlot {
     unsigned long long t_done_clk;
     unsigned int       seq;
     unsigned int       owner;
+    unsigned long long t_push_ns;   // copied from HybridInputRec at process time
 };
 
 struct HybridS2S3Config {
@@ -72,6 +73,10 @@ struct HybridS2S3Config {
     unsigned int*    version[2];
     GpuTimingSlot*   timing[2];
     unsigned int     timing_mask;
+    unsigned int     _pad_timing;
+    // Per-block calibration: see ssla_s2_s3_head_celled.cuh for details.
+    unsigned long long* kernel_start_clk[2];
+    unsigned long long* kernel_end_clk[2];
 };
 
 struct HybridInputRec {
@@ -80,6 +85,7 @@ struct HybridInputRec {
     unsigned short     x;
     unsigned short     y;
     float              feat1[24];
+    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at ring publish
 };
 
 struct HybridS2S3OutputSlot {

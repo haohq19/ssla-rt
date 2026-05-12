@@ -62,6 +62,7 @@ struct GpuTimingSlot {
     unsigned long long t_done_clk;
     unsigned int       seq;
     unsigned int       owner;
+    unsigned long long t_push_ns;   // copied from HybridInputRec at process time
 };
 
 struct HybridS2S3Config {
@@ -80,6 +81,14 @@ struct HybridS2S3Config {
     unsigned int*    version[2];
     GpuTimingSlot*   timing[2];
     unsigned int     timing_mask;
+    unsigned int     _pad_timing;
+    // Per-block calibration slots. Kernel writes clock64() at entry into
+    // kernel_start_clk[blk] and at exit (stop-flag observed) into
+    // kernel_end_clk[blk]. The host records its CLOCK_MONOTONIC_RAW
+    // immediately around launch / sync to form two known
+    // (cpu_ns, sm_cycles) pairs; effective ns/cycle = slope between them.
+    unsigned long long* kernel_start_clk[2];
+    unsigned long long* kernel_end_clk[2];
 };
 
 struct HybridInputRec {
@@ -88,6 +97,7 @@ struct HybridInputRec {
     unsigned short     x;
     unsigned short     y;
     float              feat1[24];
+    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at ring publish
 };
 
 struct HybridS2S3OutputSlot {
@@ -261,6 +271,8 @@ struct EventSlot {
     int   is_owner;
     int   pass2;
     int   pass3;
+    int   _pad;                  // keep 8-byte alignment for the u64 below
+    unsigned long long t_push_ns; // copy of HybridInputRec.t_push_ns at load
 };
 
 
@@ -482,6 +494,13 @@ void k_ssla_s2s3_celled_drain_n(
     HybridS2S3OutputSlot*   out  = (blk == 0) ? out0  : out1;
     const int               n    = (blk == 0) ? n0    : n1;
 
+    // Per-block calibration: write SM clock at kernel entry so host can
+    // correlate this against CPU CLOCK_MONOTONIC_RAW (recorded just before
+    // cuLaunch) to map event done_clk → CPU-clock latency.
+    if (threadIdx.x == 0 && cfg.kernel_start_clk[blk] != 0) {
+        *cfg.kernel_start_clk[blk] = clock64();
+    }
+
     // ---- SMEM layout (offsets in floats / ints) ----
     char* smem = (char*)smem_raw;
     EventSlot* event_slots = (EventSlot*)smem;
@@ -531,6 +550,7 @@ void k_ssla_s2s3_celled_drain_n(
                      (int)rec.x <  strip.owned_hi) ? 1 : 0;
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
+                event_slots[e].t_push_ns = rec.t_push_ns;
             }
         }
         __syncthreads();
@@ -653,6 +673,12 @@ void k_ssla_s2s3_celled_persistent(
     volatile unsigned long long* tail        = (blk == 0) ? tail0        : tail1;
     volatile unsigned long long* events_done = (blk == 0) ? events_done0 : events_done1;
 
+    // Per-block calibration: SM clock at kernel entry.
+    if (threadIdx.x == 0 && cfg.kernel_start_clk[blk] != 0) {
+        *cfg.kernel_start_clk[blk] = clock64();
+        __threadfence_system();
+    }
+
     char* smem = (char*)smem_raw;
     EventSlot* event_slots = (EventSlot*)smem;
     char* p = smem + sizeof(EventSlot) * BATCH;
@@ -687,7 +713,15 @@ void k_ssla_s2s3_celled_persistent(
         // Stop check.
         if (threadIdx.x == 0) want_stop = *stop_flag;
         __syncthreads();
-        if (want_stop) return;
+        if (want_stop) {
+            // Calibration anchor at exit: pair with host CPU time recorded
+            // right after cuCtxSynchronize.
+            if (threadIdx.x == 0 && cfg.kernel_end_clk[blk] != 0) {
+                *cfg.kernel_end_clk[blk] = clock64();
+                __threadfence_system();
+            }
+            return;
+        }
 
         // Probe ring: wait for at least 1 event, take up to BATCH.
         if (threadIdx.x == 0) {
@@ -739,6 +773,7 @@ void k_ssla_s2s3_celled_persistent(
                      (int)rec.x <  strip.owned_hi) ? 1 : 0;
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
+                event_slots[e].t_push_ns = rec.t_push_ns;
             }
         }
         __syncthreads();
@@ -835,6 +870,11 @@ void k_ssla_s2s3_celled_persistent(
                                         && (pass2[e] != 0)
                                         && (pass3[e] != 0);
                 ts->owner = owner_pass3 ? 1u : 0u;
+                // Preserve CPU arrival timestamp for end-to-end latency
+                // computation. We read from event_slots (loaded at batch
+                // start) rather than the ring directly — the ring may have
+                // wrapped by now and the slot may contain a newer event.
+                ts->t_push_ns = event_slots[e].t_push_ns;
             }
         }
         __syncthreads();

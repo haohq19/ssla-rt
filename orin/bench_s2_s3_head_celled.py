@@ -90,7 +90,7 @@ def _smem_size_bytes():
     """Compute total dynamic SMEM the kernel needs, matching the kernel's
     pointer-bump allocation."""
     # EventSlot = float[96] + float[96] + 5 ints (no padding assumed)
-    event_slot = OUT_MAX * 4 + OUT_MAX * 4 + 5 * 4   # = 788
+    event_slot = OUT_MAX * 4 + OUT_MAX * 4 + 5 * 4 + 4 + 8  # 5 ints + pad + u64
     smem = (
         event_slot * BATCH +                          # event_slots
         BATCH * N_WARPS * OUT_MAX * 4 +               # contrib
