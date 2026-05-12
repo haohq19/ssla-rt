@@ -20,6 +20,9 @@ outputs/
 *.swo
 .DS_Store
 
+# Claude local settings (per-user; not for git history)
+.claude/settings.local.json
+
 # Local-only test fixtures
 /tmp/
 test_weights/
