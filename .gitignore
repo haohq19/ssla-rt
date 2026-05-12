@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.pyc
+__pycache__/
+
+# Cache / state
+cache/
+outputs/
+.cuda_cache/
+.nvrtc_cache/
+*.npz.cache
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local-only test fixtures
+/tmp/
+test_weights/
