@@ -52,6 +52,11 @@ struct LayerWeights {
     int num_pos  = 1;          // 1 (no-PAP) or 9 (PAP)
     std::array<std::vector<float>, kPatchArea> qvgIn{};
     std::array<std::vector<float>, kPatchArea> goW{};
+    // goW_T[p][i*OUT + j] = goW[p][j*OUT + i] (row-major transpose). Used by
+    // tile-streaming fused kernels (Phase 6) to avoid stack spills in s1
+    // layers — without transpose, the tile-by-input matvec_accum needs
+    // strided column loads which are slow on NEON. One-time init cost.
+    std::array<std::vector<float>, kPatchArea> goW_T{};
     std::vector<float> input_proj;   // (OUT, IN) if in_dim != out_dim, else empty
     std::vector<float> ln_gamma;     // (OUT,)
     std::vector<float> ln_beta;      // (OUT,)

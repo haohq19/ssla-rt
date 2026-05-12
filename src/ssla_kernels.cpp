@@ -128,6 +128,17 @@ void load_layer(const std::unordered_map<std::string, openeva::Tensor>& W,
         auto g_in = openeva::prim::mm(gV, out_dim, out_dim, scatter, out_dim, in_dim);
         L.qvgIn[p] = pack_qvg(q_in, v_in, g_in, out_dim, in_dim);
         L.goW[p]   = openeva::prim::mm(gather, out_dim, out_dim, oV, out_dim, out_dim);
+        // Pre-compute goW transpose for tile-streaming fused kernels:
+        //   goW_T[p][i*OUT + j] = goW[p][j*OUT + i]
+        // One-time cost (out_dim² floats per patch position) traded for
+        // contiguous column access in the per-tile inner loop.
+        L.goW_T[p].assign(static_cast<std::size_t>(out_dim) * out_dim, 0.0f);
+        for (int j = 0; j < out_dim; ++j) {
+            for (int i = 0; i < out_dim; ++i) {
+                L.goW_T[p][static_cast<std::size_t>(i) * out_dim + j]
+                    = L.goW[p][static_cast<std::size_t>(j) * out_dim + i];
+            }
+        }
     }
 
     if (const openeva::Tensor* ip = maybe_get(W, prefix + "/input_proj/weight")) {

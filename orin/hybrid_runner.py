@@ -215,6 +215,28 @@ def main() -> int:
                     help="CPU shard count for libstage01_to_gpu")
     ap.add_argument("--halo", type=int, default=2)
     ap.add_argument("--base-core", type=int, default=0)
+    ap.add_argument("--pin-python-main", action="store_true",
+                    help="Pin Python main + cam_thread to core 0 so C++ "
+                         "workers (which self-pin to base_core..base_core+N) "
+                         "don't share cores with the dispatcher")
+    ap.add_argument("--python-pin-core", type=int, default=0,
+                    help="If --pin-python-main, pin Python main thread to "
+                         "this core (default 0).")
+    ap.add_argument("--cpp-synth", action="store_true",
+                    help="Use C++ synthetic dispatcher (tsc-paced) instead of "
+                         "Python SyntheticReader. Eliminates time.sleep ms "
+                         "jitter and GIL interference. Caller specifies a pin "
+                         "core via --synth-pin-core.")
+    ap.add_argument("--synth-pin-core", type=int, default=-1,
+                    help="Core to pin C++ synth dispatcher thread to. -1 = "
+                         "no pin (lets OS schedule). Recommended: pick a core "
+                         "outside base_core..base_core+shards range.")
+    ap.add_argument("--shard-ring-cap", type=int, default=1 << 16,
+                    help="Per-shard SPSC ring capacity (power of 2, ≥ 4). "
+                         "Smaller = lower max queue latency, but more "
+                         "back-pressure on the dispatcher. At 1.8 Mev/s admit "
+                         "& 3 µs/msg, 65536 → ~200 ms worst-case queue wait; "
+                         "64 → ~200 µs; 16 → ~50 µs.")
     ap.add_argument("--tdrop", type=int, default=4)
     ap.add_argument("--ring-cap", type=int, default=1 << 16,
                     help="per-block ring capacity (power of 2)")
@@ -238,6 +260,14 @@ def main() -> int:
                     help="coop = block-cooperative (ssla_s2_s3_head.cuh); "
                          "celled = cell-owner warps (ssla_s2_s3_head_celled.cuh)")
     args = ap.parse_args()
+
+    # Pin the Python main thread (+ inherited by cam_thread and stats poller)
+    # to core 0. C++ shard workers self-pin to base_core..base_core+N via
+    # pthread_setaffinity_np inside shard_worker, escaping this mask. This
+    # keeps the dispatcher (Python) off the worker cores when --base-core ≥ 1.
+    if args.pin_python_main:
+        import os
+        os.sched_setaffinity(0, {args.python_pin_core})
 
     if args.ring_cap & (args.ring_cap - 1):
         sys.exit(f"--ring-cap must be power of 2, got {args.ring_cap}")
@@ -353,7 +383,8 @@ def main() -> int:
     print(f"Loading {LIB_PATH}", flush=True)
     api = S01gAPI(LIB_PATH)
     api.init(args.weights, n_shards=args.shards, halo=args.halo,
-             base_core=args.base_core, sample_cap=65536)
+             base_core=args.base_core, sample_cap=65536,
+             shard_ring_cap=args.shard_ring_cap)
     api.attach(ring_dev[0], ring_head[0], ring_dev[1], ring_head[1],
                 args.ring_cap - 1, W2, H2,
                 proc_lo[0], proc_hi[0], proc_lo[1], proc_hi[1])
@@ -362,7 +393,13 @@ def main() -> int:
 
     # ---- 5. Event source: live camera or synthetic ---------------------
     stop_event = threading.Event()
-    if args.synthetic_mev > 0:
+    cam_thread = None
+    cpp_synth = args.synthetic_mev > 0 and args.cpp_synth
+    if cpp_synth:
+        print(f"C++ synth dispatcher @ {args.synthetic_mev:.2f} Mev/s "
+              f"(pin core {args.synth_pin_core})", flush=True)
+        api.start_synthetic(args.synthetic_mev, args.synth_pin_core, args.seed)
+    elif args.synthetic_mev > 0:
         cam_thread = SyntheticReader(
             api,
             target_mev=args.synthetic_mev,
@@ -370,7 +407,7 @@ def main() -> int:
             seed=args.seed,
             stop_event=stop_event,
         )
-        print(f"Synthetic source @ {args.synthetic_mev:.2f} Mev/s "
+        print(f"Python synthetic source @ {args.synthetic_mev:.2f} Mev/s "
               f"(no camera)", flush=True)
     else:
         cam_thread = CameraReader(
@@ -386,13 +423,14 @@ def main() -> int:
         stop_event.set()
     signal.signal(signal.SIGINT, _sigint)
 
-    cam_thread.start()
+    if cam_thread is not None:
+        cam_thread.start()
     t_start = time.monotonic()
 
     # ---- 6. Stats loop ------------------------------------------------
     headers = ("t   |  cam_in    |  raw   kept |"
                "  push0   push1 |  done0   done1 |"
-               " ring0  ring1 |  CPU p50/p99 µs")
+               " ring0  ring1 |  CPU p50/p99/MAX µs")
     print(headers, flush=True)
     last_done = [0, 0]
     last_pushed = [0, 0]
@@ -410,7 +448,8 @@ def main() -> int:
         head0, head1 = _read_u64(ring_head[0]), _read_u64(ring_head[1])
         done0, done1 = _read_u64(events_done[0]), _read_u64(events_done[1])
         ring_used0, ring_used1 = head0 - done0, head1 - done1
-        rate_in    = cam_thread.events_in
+        rate_in    = (cam_thread.events_in if cam_thread is not None
+                       else api.synthetic_n_pushed())
         push_b0    = int(st[14])
         push_b1    = int(st[15])
         d_done0 = done0 - last_done[0]
@@ -425,12 +464,18 @@ def main() -> int:
               f"raw {int(st[0])+int(st[1]):7d}  k{int(st[13]):6d} | "
               f"+{d_push0:5d} +{d_push1:5d} | +{d_done0:5d} +{d_done1:5d} | "
               f"{ring_used0:5d} {ring_used1:5d} | "
-              f"{st[6]:5.1f}/{st[8]:6.1f}",
+              f"{st[6]:5.1f}/{st[8]:6.1f}/{st[10]:7.1f}",
               flush=True)
 
     # ---- 7. Shutdown ---------------------------------------------------
-    print("[main] stopping camera thread ...", flush=True)
-    cam_thread.join(timeout=2.0)
+    synth_total = 0
+    if cpp_synth:
+        synth_total = api.synthetic_n_pushed()
+        print("[main] stopping C++ synth dispatcher ...", flush=True)
+        api.stop_synthetic()
+    if cam_thread is not None:
+        print("[main] stopping camera thread ...", flush=True)
+        cam_thread.join(timeout=2.0)
     # Snapshot per-segment timing BEFORE shutdown — api.stats() requires
     # the lib handle which shutdown destroys.
     final_stats = api.stats()
@@ -448,7 +493,7 @@ def main() -> int:
     # Final stats.
     head0, head1 = _read_u64(ring_head[0]), _read_u64(ring_head[1])
     done0, done1 = _read_u64(events_done[0]), _read_u64(events_done[1])
-    print(f"\n[final] cam events submitted: {cam_thread.events_in}")
+    print(f"\n[final] cam events submitted: {(cam_thread.events_in if cam_thread is not None else synth_total)}")
     print(f"[final] ring head:    block 0 = {head0:9d}, block 1 = {head1:9d}")
     print(f"[final] events_done:  block 0 = {done0:9d}, block 1 = {done1:9d}")
     print(f"[final] ring lag:     block 0 = {head0-done0}, block 1 = {head1-done1}")
@@ -517,7 +562,7 @@ def main() -> int:
         print(f"{b:>5} | {no:>8d} {p50o:>8.1f} {p90o:>8.1f} "
               f"{p99o:>8.1f} {maxo:>8.1f} | {na:>8d} {p50a:>8.1f} {p99a:>8.1f}")
 
-    p2_pass = (cam_thread.events_in > 0
+    p2_pass = ((cam_thread.events_in if cam_thread is not None else synth_total) > 0
                and done0 > 0 and done1 > 0
                and abs(head0 - done0) < args.ring_cap
                and abs(head1 - done1) < args.ring_cap
@@ -526,7 +571,7 @@ def main() -> int:
         print(f"\nP2 PASS — both blocks advanced and wrote non-zero predictions; "
               f"no ring deadlock.")
         return 0
-    print(f"\nP2 FAIL — events_in={cam_thread.events_in} "
+    print(f"\nP2 FAIL — events_in={(cam_thread.events_in if cam_thread is not None else synth_total)} "
           f"done={done0,done1} preds_nonzero={pred_nonzero}")
     return 1
 

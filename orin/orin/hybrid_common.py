@@ -331,6 +331,10 @@ class S01gAPI:
         L.s01g_init.restype = ctypes.c_void_p
         L.s01g_init.argtypes = [ctypes.c_char_p, ctypes.c_int,
                                 ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        L.s01g_init_full.restype = ctypes.c_void_p
+        L.s01g_init_full.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_uint]
         L.s01g_attach_gpu_rings.restype = None
         L.s01g_attach_gpu_rings.argtypes = [
             ctypes.c_void_p,
@@ -352,12 +356,20 @@ class S01gAPI:
         L.s01g_reset_stats.argtypes = [ctypes.c_void_p]
         L.s01g_shutdown.restype = None
         L.s01g_shutdown.argtypes = [ctypes.c_void_p]
+        L.s01g_start_synthetic.restype = None
+        L.s01g_start_synthetic.argtypes = [ctypes.c_void_p, ctypes.c_double,
+                                            ctypes.c_int, ctypes.c_uint64]
+        L.s01g_stop_synthetic.restype = None
+        L.s01g_stop_synthetic.argtypes = [ctypes.c_void_p]
+        L.s01g_synthetic_n_pushed.restype = ctypes.c_uint64
+        L.s01g_synthetic_n_pushed.argtypes = [ctypes.c_void_p]
         self.handle = None
 
     def init(self, weights_dir: str, n_shards: int, halo: int,
-             base_core: int, sample_cap: int):
-        self.handle = self.lib.s01g_init(weights_dir.encode(), n_shards,
-                                          halo, base_core, sample_cap)
+             base_core: int, sample_cap: int, shard_ring_cap: int = 1 << 16):
+        self.handle = self.lib.s01g_init_full(weights_dir.encode(), n_shards,
+                                                halo, base_core, sample_cap,
+                                                shard_ring_cap)
         if not self.handle:
             raise RuntimeError("s01g_init returned NULL "
                                "(check weights_dir / meta.json)")
@@ -390,6 +402,20 @@ class S01gAPI:
 
     def reset(self):
         self.lib.s01g_reset_stats(self.handle)
+
+    def start_synthetic(self, rate_mev: float, pin_core: int, seed: int):
+        """Start a C++-side synthetic event generator. Uses rdtsc spin-pacing
+        for ns-precision event spacing — replacement for Python SyntheticReader
+        which is limited to time.sleep millisecond precision and has GIL /
+        interpreter jitter that spikes MAX latency to ~700 µs even at 0.1 Mev/s.
+        """
+        self.lib.s01g_start_synthetic(self.handle, rate_mev, pin_core, seed)
+
+    def stop_synthetic(self):
+        self.lib.s01g_stop_synthetic(self.handle)
+
+    def synthetic_n_pushed(self) -> int:
+        return int(self.lib.s01g_synthetic_n_pushed(self.handle))
 
     def shutdown(self):
         if self.handle is not None:

@@ -28,6 +28,8 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <errno.h>
 #endif
 
 #include "openeva/event.h"
@@ -150,6 +152,12 @@ struct S01gHandle {
     int             gpu_W2 = 0;
     int             gpu_H2 = 0;
     std::uint64_t   gpu_ring_mask = 0;
+
+    // Synthetic dispatcher (C++ side) — replaces Python SyntheticReader so
+    // we get tsc-precision pacing and no Python interpreter / GIL interference.
+    std::atomic<bool>         synth_running{false};
+    std::thread               synth_thread;
+    std::atomic<std::uint64_t> synth_n_pushed{0};
 };
 
 namespace {
@@ -269,10 +277,44 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
 extern "C" {
 
 // Same semantics as s0_init in lib_stage01_capi.cpp.
+S01gHandle* s01g_init_full(const char* weights_dir, int n_shards, int halo,
+                            int base_core, int sample_cap,
+                            unsigned int shard_ring_cap);
+
 S01gHandle* s01g_init(const char* weights_dir, int n_shards, int halo,
                        int base_core, int sample_cap) {
+    return s01g_init_full(weights_dir, n_shards, halo, base_core, sample_cap,
+                           1u << 16);
+}
+
+S01gHandle* s01g_init_full(const char* weights_dir, int n_shards, int halo,
+                            int base_core, int sample_cap,
+                            unsigned int shard_ring_cap) {
     if (n_shards < 1) n_shards = 1;
     if (sample_cap < 1024) sample_cap = 1024;
+    // Validate ring cap is power of two and ≥ 4.
+    if (shard_ring_cap < 4) shard_ring_cap = 4;
+    if (shard_ring_cap & (shard_ring_cap - 1)) {
+        std::fprintf(stderr,
+                     "[s01g_init] shard_ring_cap %u not power of 2; rounding\n",
+                     shard_ring_cap);
+        unsigned p = 1;
+        while (p < shard_ring_cap) p <<= 1;
+        shard_ring_cap = p;
+    }
+
+#if defined(__linux__)
+    // Lock all current and future memory to prevent page faults in the
+    // shard worker hot path. Cuts MAX latency spikes that come from
+    // demand paging / minor faults on hidden state / weights. Requires
+    // RLIMIT_MEMLOCK ≥ pipeline memory (~50 MB for stub geom). Falls
+    // back silently if not permitted.
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::fprintf(stderr, "[s01g_init] mlockall failed (errno %d) — "
+                     "running without memory locking, MAX latency may spike\n",
+                     errno);
+    }
+#endif
 
     deploy::TscClock::instance().tsc_to_ns(0);
 
@@ -301,7 +343,7 @@ S01gHandle* s01g_init(const char* weights_dir, int n_shards, int halo,
         c->pipe     = std::make_unique<deploy::SslaSPipeline>();
         c->pipe->load(weights_dir);
         c->pipe->reset();
-        c->q_in     = std::make_unique<ShardRing>(1u << 16);
+        c->q_in     = std::make_unique<ShardRing>(shard_ring_cap);
         c->sample_cap = static_cast<std::size_t>(sample_cap);
         c->sample_buf.assign(c->sample_cap, 0.0);
         h->ctxs.push_back(std::move(c));
@@ -463,6 +505,112 @@ void s01g_snapshot_stats(S01gHandle* h, double* out) {
     }
 }
 
+// ============================================================================
+// Synthetic dispatcher — C++ replacement for Python's SyntheticReader.
+// Uses rdtsc-based spin-pacing for ns-precision per-event spacing (Python
+// time.sleep is ~1 ms precision on stock Linux). Single producer thread,
+// pinable to a dedicated core via pin_core (≥0); when negative, the thread
+// runs un-pinned.
+//
+// Event generation: xorshift64 RNG. Distributes events uniformly over the
+// (W_full × H_full) grid. Polarity = 1 bit of state.
+// ============================================================================
+namespace {
+void synth_thread_main(S01gHandle* h, double rate_mev, int pin_core,
+                       std::uint64_t seed) {
+    if (pin_core >= 0) pin_to_core(pin_core);
+
+    // ns_per_event = 1e9 / (rate_mev × 1e6). At 2 Mev/s → 500 ns.
+    const double tsc_to_ns = deploy::TscClock::instance().tsc_to_ns(1);
+    const std::uint64_t ns_per_event =
+        (rate_mev > 0.0) ? static_cast<std::uint64_t>(1e9 / (rate_mev * 1e6)) : 0;
+    // Convert ns to tsc ticks. On aarch64 tsc_to_ns(1) returns ≈ 1 so ticks≈ns,
+    // but stay portable by dividing.
+    const std::uint64_t ticks_per_event = (ns_per_event > 0)
+        ? static_cast<std::uint64_t>(ns_per_event / tsc_to_ns) : 0;
+
+    std::uint64_t state = seed ? seed : 0x9E3779B97F4A7C15ULL;
+    auto xorshift = [&]() -> std::uint64_t {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        return state;
+    };
+
+    const int W_full = h->W_full;
+    const int H_full = h->H_full;
+    const int strip  = h->strip_w;
+    const int halo   = h->halo;
+    const int n_shards = h->N;
+
+    std::uint64_t next_tick = deploy::rdtsc_now();
+    float ev_t_us = 0.0f;
+    const float dt_per_event_us =
+        (rate_mev > 0.0) ? static_cast<float>(1.0 / rate_mev) : 1.0f;
+
+    while (h->synth_running.load(std::memory_order_relaxed)) {
+        // Spin-wait until the next scheduled event time. tsc-precision.
+        while (true) {
+            const std::uint64_t now = deploy::rdtsc_now();
+            if (now >= next_tick) break;
+#if defined(__aarch64__)
+            asm volatile("yield" ::: "memory");
+#endif
+        }
+        next_tick += ticks_per_event;
+
+        // Generate one event.
+        const std::uint64_t r = xorshift();
+        const int ex = static_cast<int>(r % static_cast<std::uint64_t>(W_full));
+        const int ey = static_cast<int>((r >> 16) %
+                                         static_cast<std::uint64_t>(H_full));
+        const float p = static_cast<float>((r >> 32) & 1ULL);
+        ev_t_us += dt_per_event_us;
+
+        // Route to owner + halo neighbour shard(s).
+        const int owner = std::min(ex / strip, n_shards - 1);
+        const std::uint64_t t_arr = deploy::rdtsc_now();
+        for (int dk = -1; dk <= 1; ++dk) {
+            const int k = ex / strip + dk;
+            if (k < 0 || k >= n_shards) continue;
+            const int lo = k * strip - halo;
+            const int hi = (k + 1) * strip + halo;
+            if (ex < lo || ex >= hi) continue;
+            ShardMsg m;
+            m.t_arr_tsc = t_arr;
+            m.ev.t = ev_t_us;
+            m.ev.x = static_cast<float>(ex);
+            m.ev.y = static_cast<float>(ey);
+            m.ev.p = p;
+            m.is_owner = (k == owner);
+            m.eof = false;
+            h->ctxs[k]->q_in->push(m);
+        }
+        h->synth_n_pushed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+}  // namespace
+
+void s01g_start_synthetic(S01gHandle* h, double rate_mev, int pin_core,
+                           std::uint64_t seed) {
+    if (!h) return;
+    if (h->synth_running.load()) return;   // already running
+    h->synth_running.store(true, std::memory_order_release);
+    h->synth_n_pushed.store(0, std::memory_order_relaxed);
+    h->synth_thread = std::thread(synth_thread_main, h, rate_mev, pin_core, seed);
+}
+
+void s01g_stop_synthetic(S01gHandle* h) {
+    if (!h) return;
+    h->synth_running.store(false, std::memory_order_release);
+    if (h->synth_thread.joinable()) h->synth_thread.join();
+}
+
+std::uint64_t s01g_synthetic_n_pushed(S01gHandle* h) {
+    if (!h) return 0;
+    return h->synth_n_pushed.load(std::memory_order_relaxed);
+}
+
 void s01g_reset_stats(S01gHandle* h) {
     if (!h) return;
     for (auto& c : h->ctxs) {
@@ -485,6 +633,11 @@ void s01g_reset_stats(S01gHandle* h) {
 
 void s01g_shutdown(S01gHandle* h) {
     if (!h) return;
+    // Stop synth dispatcher first so it doesn't push to a shutting-down ring.
+    if (h->synth_running.load()) {
+        h->synth_running.store(false, std::memory_order_release);
+        if (h->synth_thread.joinable()) h->synth_thread.join();
+    }
     for (auto& c : h->ctxs) {
         ShardMsg m{}; m.eof = true;
         c->q_in->push(m);
