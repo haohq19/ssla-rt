@@ -78,6 +78,17 @@ struct GpuBlockCfg {
     std::atomic<std::uint64_t> n_pushed{0};
 };
 
+// Per-event segment ids — index into ShardCtx::seg_sum_ticks / seg_count.
+enum Seg : int {
+    SEG_PREPROCESS = 0,
+    SEG_S0         = 1,   // pipe.stage_forward(0)  — runs on every event
+    SEG_TDROP0     = 2,   // owner only
+    SEG_S1         = 3,   // owner only, after pass0
+    SEG_TDROP1     = 4,   // owner only, after pass0
+    SEG_PUSH       = 5,   // owner only, after pass1; GPU ring write
+    NUM_SEGS       = 6,
+};
+
 struct ShardCtx {
     int  shard_id;
     int  core_id;
@@ -93,7 +104,18 @@ struct ShardCtx {
     std::atomic<std::uint64_t> total_halo{0};
     std::atomic<std::uint64_t> pass_stage0{0};
     std::atomic<std::uint64_t> pass_stage1{0};
+
+    // Per-segment cumulative timing — sum of rdtsc_now() deltas (raw ticks;
+    // converted to ns at snapshot time via TscClock). Each shard writes only
+    // its own counters; snapshot reads them across shards via relaxed atomics.
+    std::atomic<std::uint64_t> seg_sum_ticks[NUM_SEGS]{};
+    std::atomic<std::uint64_t> seg_count[NUM_SEGS]{};
 };
+
+inline void seg_record(ShardCtx* ctx, int seg, std::uint64_t dt_ticks) {
+    ctx->seg_sum_ticks[seg].fetch_add(dt_ticks, std::memory_order_relaxed);
+    ctx->seg_count[seg].fetch_add(1, std::memory_order_relaxed);
+}
 
 }  // namespace
 
@@ -150,16 +172,32 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
             continue;
         }
 
+        const std::uint64_t t_seg0 = deploy::rdtsc_now();
         pipe.preprocess(m.ev, feat_in);
+        const std::uint64_t t_seg1 = deploy::rdtsc_now();
+        seg_record(ctx, SEG_PREPROCESS, t_seg1 - t_seg0);
+
         int x = ex0, y = ey0;
         pipe.stage_forward(0, x, y, feat_in, feat0.data());
+        const std::uint64_t t_seg2 = deploy::rdtsc_now();
+        seg_record(ctx, SEG_S0, t_seg2 - t_seg1);
 
         if (m.is_owner) {
             const bool pass0 = pipe.tdrop_and_pool(0, x, y);
+            const std::uint64_t t_seg3 = deploy::rdtsc_now();
+            seg_record(ctx, SEG_TDROP0, t_seg3 - t_seg2);
+
             bool pass1 = false;
+            std::uint64_t t_after_s1_block = t_seg3;
             if (pass0) {
                 pipe.stage_forward(1, x, y, feat0.data(), feat1.data());
+                const std::uint64_t t_seg4 = deploy::rdtsc_now();
+                seg_record(ctx, SEG_S1, t_seg4 - t_seg3);
+
                 pass1 = pipe.tdrop_and_pool(1, x, y);
+                const std::uint64_t t_seg5 = deploy::rdtsc_now();
+                seg_record(ctx, SEG_TDROP1, t_seg5 - t_seg4);
+                t_after_s1_block = t_seg5;
             }
 
             // ---- HYBRID HOOK: push to GPU per-block ring(s) ----
@@ -187,6 +225,8 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
                         gb.n_pushed.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
+                const std::uint64_t t_seg6 = deploy::rdtsc_now();
+                seg_record(ctx, SEG_PUSH, t_seg6 - t_after_s1_block);
             }
 
             const std::uint64_t t1 = deploy::rdtsc_now();
@@ -334,11 +374,15 @@ int s01g_submit_batch(S01gHandle* h, const float* events_packed, int n) {
     return accepted;
 }
 
-// Same layout as s0_snapshot_stats, with two extra slots:
+// Layout (32 slots total; slots 0..15 unchanged from prior contract):
+//   [0..15] — original stats (see prior comment in lib_stage01_capi.cpp)
 //   [14] gpu_pushed_block_0
 //   [15] gpu_pushed_block_1
+//   [16..21] per-segment sum_ns:  preprocess, s0, tdrop0, s1, tdrop1, push
+//   [22..27] per-segment count:   preprocess, s0, tdrop0, s1, tdrop1, push
+//   [28..31] reserved.
 void s01g_snapshot_stats(S01gHandle* h, double* out) {
-    for (int i = 0; i < 16; ++i) out[i] = 0.0;
+    for (int i = 0; i < 32; ++i) out[i] = 0.0;
     if (!h) return;
 
     const auto now = std::chrono::steady_clock::now();
@@ -384,6 +428,23 @@ void s01g_snapshot_stats(S01gHandle* h, double* out) {
         out[11] = stats.mean_ns  * 1e-3;
         out[12] = static_cast<double>(samples.size());
     }
+
+    // Per-segment timing: aggregate sum_ticks and count across shards.
+    std::uint64_t seg_sum_ticks_tot[NUM_SEGS] = {0};
+    std::uint64_t seg_count_tot[NUM_SEGS]     = {0};
+    for (auto& c : h->ctxs) {
+        for (int s = 0; s < NUM_SEGS; ++s) {
+            seg_sum_ticks_tot[s] += c->seg_sum_ticks[s].load(
+                std::memory_order_relaxed);
+            seg_count_tot[s] += c->seg_count[s].load(
+                std::memory_order_relaxed);
+        }
+    }
+    const auto& clk = deploy::TscClock::instance();
+    for (int s = 0; s < NUM_SEGS; ++s) {
+        out[16 + s] = clk.tsc_to_ns(seg_sum_ticks_tot[s]);
+        out[22 + s] = static_cast<double>(seg_count_tot[s]);
+    }
 }
 
 void s01g_reset_stats(S01gHandle* h) {
@@ -394,6 +455,10 @@ void s01g_reset_stats(S01gHandle* h) {
         c->pass_stage0.store(0, std::memory_order_relaxed);
         c->pass_stage1.store(0, std::memory_order_relaxed);
         c->sample_idx.store(0, std::memory_order_relaxed);
+        for (int s = 0; s < NUM_SEGS; ++s) {
+            c->seg_sum_ticks[s].store(0, std::memory_order_relaxed);
+            c->seg_count[s].store(0, std::memory_order_relaxed);
+        }
     }
     for (int b = 0; b < N_GPU_BLOCKS; ++b) {
         h->gpu_block[b].n_pushed.store(0, std::memory_order_relaxed);

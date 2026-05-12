@@ -381,7 +381,10 @@ class S01gAPI:
         return self.lib.s01g_submit_batch(self.handle, ptr, n)
 
     def stats(self):
-        out = (ctypes.c_double * 16)()
+        # 32 slots: 0..15 legacy stats, 16..21 per-segment sum_ns,
+        # 22..27 per-segment counts, 28..31 reserved. See
+        # src/lib_stage01_to_gpu.cpp::s01g_snapshot_stats for the contract.
+        out = (ctypes.c_double * 32)()
         self.lib.s01g_snapshot_stats(self.handle, out)
         return list(out)
 

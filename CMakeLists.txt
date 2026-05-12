@@ -54,6 +54,14 @@ set_target_properties(ssla_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_executable(oracle_diff src/oracle_diff.cpp)
 target_link_libraries(oracle_diff PRIVATE Threads::Threads)
 
+# ---- Microbench: scalar vs hand-NEON matvec_ct<12, 36> ----------------------
+# Drives the Phase-2 decision on whether to write NEON specializations for
+# the IN=12 layers (stage-0 L1 hot path). See STATUS.md §8.4 for context.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  add_executable(bench_matvec12 tests/bench_matvec12.cpp)
+  target_link_libraries(bench_matvec12 PRIVATE openeva_vendor)
+endif()
+
 # ---- CPU pipeline shared libs (Python callers via ctypes) -------------------
 add_library(stage0_capi SHARED src/lib_stage0_capi.cpp)
 target_link_libraries(stage0_capi PRIVATE ssla_kernels openeva_vendor Threads::Threads)

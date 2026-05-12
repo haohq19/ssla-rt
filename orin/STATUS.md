@@ -1183,3 +1183,326 @@ per-batch divided by 8). Tail (p99) grows from 0.35 ms → 1.6 ms, still
    kev/s admit (§6 P2 result). To exercise the new GPU drain ceiling
    we'd need a more active scene (waved hand at the camera, or contrast
    threshold tuned for higher event rate).
+
+## §8 — Re-measurement (2026-05-12): shard-count sweep + GPU drain correction
+
+This section re-runs §7's saturation experiments first-hand on the same
+build and stub weights, and corrects three statements in §7 that did not
+reproduce. Hardware confirmed via `/proc/cpuinfo`, `/sys/.../scaling_max_freq`,
+and `cuDeviceGetAttribute`:
+
+- 8 × Cortex-A78AE @ 1.984 GHz, NEON (asimd) + fphp + asimddp.
+- Orin GPU CC 8.7, 8 SMs @ 918 MHz, `CONCURRENT_MANAGED_ACCESS = 0`.
+
+### §8.1 — Shard-count sweep at synthetic 2.0 Mev/s, 12–14 s each
+
+Measured admit (steady-state 2 s window, 8 s–10 s) and aggregate GPU
+drain. All runs use `--kernel-variant celled --halo 2`, default geometry
+(80×64 → s2 20×16), stub weights from `tools/make_ssla_stub.py`.
+
+| n_shards | admit (Mev/s) | GPU push agg (kev/s) | GPU done agg (kev/s) | ring lag trend | stable? | bottleneck |
+|---:|---:|---:|---:|:---|:---:|:---|
+| 1 | **0.135** |  10.2 |  10.2 | 0 (flat)      | yes | CPU |
+| 2 | **0.264** |  19.9 |  19.9 | 0 (flat)      | yes | CPU |
+| 4 | **0.494** |  37.6 |  37.6 | <50 (flat)    | yes | CPU |
+| 5 | **0.602** |  45.5 |  45.5 | <100 (flat)   | **yes — matched point ★** | balanced |
+| 6 | **0.677** |  51.5 |  47.4 | growing +2k/s | no  | GPU |
+| 7 | **0.764** |  58.2 |  47.0 | growing +5k/s | no  | GPU |
+| 8 | **0.821** |  61.6 |  47.0 | exploding     | no  | GPU |
+
+(Push = "kept" rate × ~1.2 because each kept event lands in 1–2 GPU
+blocks depending on s2-x overlap. Done = sum of per-block events_done
+deltas.)
+
+### §8.2 — Corrections to §7
+
+1. **GPU drain ceiling is ~47 kev/s aggregate, not 44.7.** §7 table at
+   line 1118 reports "GPU drain agg 44.7 kev/s" at 0.5 Mev/s submit.
+   First-hand at n_shards=5 (the matched point), live persistent-kernel
+   aggregate done = **45.5 kev/s sustained**, and at n=6 it briefly hits
+   **47.4 kev/s** before being bottlenecked by host-pinned ring scheduling.
+   The live persistent kernel actually drains *faster* than the offline
+   `drain_n` bench (which reports 41–43 kev/s for the same kernel) because
+   it amortises fixed batch-dispatch overhead across the continuous stream.
+
+2. **"GPU has another ~1.5× drain ceiling left" (§7 line 1166) is wrong.**
+   That claim was extrapolated from the offline `drain_n` number. In live
+   operation the persistent kernel is already at its drain ceiling at
+   ~0.6 Mev/s admit: at n_shards=6 we measure push 51.5 vs done 47.4
+   (push > done, ring grows linearly). There is no 1.5× headroom — the
+   GPU is the next ceiling, immediately above CPU's current 4-shard cap.
+
+3. **4-shard admit is 0.49 Mev/s, not 0.60 Mev/s.** §7 line 1119 reports
+   "0.60 Mev/s admit at 4 shards under 0.5 Mev/s submit". I cannot
+   reproduce this in the same configuration; 4-shard steady-state admit
+   is **0.494 Mev/s** sustained over 12 s. The 0.60 Mev/s admit figure
+   *does* reproduce, but at **n_shards = 5**, not 4. Most likely §7 was
+   misattributed across configs; the underlying GPU-drain-bound number is
+   the same (~0.60 Mev/s). All §7 §-references to "0.6 Mev/s admit" should
+   be read as "the GPU-drain-bound admit, currently reached at 5 shards".
+
+### §8.3 — Implications for "push past 0.6 Mev/s"
+
+§7's "Next steps" item 1 (line 1166-1174) proposes CPU-side scaling
+(more shards, NEON SIMD, halo reduction) on the premise that GPU has
+1.5× headroom. **That premise is wrong.** With the celled kernel as-is,
+beyond ~0.62 Mev/s admit the GPU is the bottleneck regardless of how
+fast CPU is. Therefore:
+
+- **CPU work alone cannot push admit past ~0.62 Mev/s.** More shards
+  beyond 5 produce more admit, but the GPU ring backlogs (n=6 grows
+  ~2 k events/s, n=8 ~14 k/s), which is unstable.
+- **GPU work is required first** to lift the ~47 kev/s aggregate drain
+  ceiling. §7's "Next steps" item 2 (BATCH 8→4, 2 blocks/SM) is the
+  prerequisite, not the follow-up.
+- Once GPU drain is lifted to ~90 kev/s aggregate, CPU side at n_shards
+  ∈ {6, 7, 8} could push admit toward ~1.0 Mev/s.
+
+### §8.4 — Matvec vectorization status (correcting §7 line 1170)
+
+§7 line 1170 says "SIMD-vectorize the inner ssla_layer matvecs (currently
+scalar)". Disassembled `build/libstage01_to_gpu.so` per layer instantiation
+(GCC 10, `-O3 -march=native -ffast-math`):
+
+| layer  | vec FMA (fmla.4s) | vec FMUL (fmul.4s) | scalar FMA | scalar FMUL | dominant style |
+|---|---:|---:|---:|---:|---|
+| `<2,12>`   |  9 |  9 | 23 | 13 | mixed |
+| `<12,12>`  |  **0** |  **0** | 26 |  6 | **fully scalar** |
+| `<12,24>`  | 10 |  2 | 15 |  5 | mixed |
+| `<24,24>`  | 25 |  5 |  4 |  4 | fully vectorized |
+| `<24,48>`  | 26 |  4 |  4 |  4 | fully vectorized |
+| `<48,48>`  | 22 |  2 |  4 |  4 | fully vectorized |
+| `<48,96>`  | 19 |  1 |  4 |  4 | fully vectorized |
+| `<96,96>`  | 16 |  0 |  4 |  4 | fully vectorized |
+
+The "currently scalar" claim is **correct for stage 0 L1** (`<12,12>`,
+the dominant per-event hot path — runs on every owner-event and every
+halo-event) but **wrong for stage 1+** which GCC has already
+NEON-vectorized via the OUT-axis. The compiler's cost model rejects
+across-IN-axis vectorization when IN=12 (3 NEON lanes wide + horizontal
+reduce vs 12 scalar FMAs in a tight unrolled chain). Manual NEON
+intrinsics for `<12, ...>` could buy a measurable per-event speedup —
+but, per §8.3, that win only translates into admit-ceiling gains once
+GPU drain is also lifted.
+
+### §8.5 — Reproduction recipe
+
+```bash
+python3 tools/make_ssla_stub.py /tmp/ssla_s_64x80/ --h 64 --w 80
+cd orin
+for N in 1 2 4 5 6 7 8; do
+  python3 hybrid_runner.py --weights /tmp/ssla_s_64x80 \
+    --h-full 64 --w-full 80 --kernel-variant celled \
+    --synthetic-mev 2.0 --duration-s 12 --stats-interval-s 2 --shards $N
+done
+```
+
+Read the 8 s window for steady-state admit; cross-check against the 10 s
+window. Skip the 2 s window (warm-up).
+
+## §9 — CPU NEON specialization for IN=12 matvecs (2026-05-12)
+
+Phase 1 of CPU-side throughput work. §8.4 disassembly showed GCC's
+auto-vectorizer rejects `matvec_ct<12, OUT>` and emits scalar 12-fmadd
+chains, dominating stage-0 L1's per-event budget. This section closes
+that gap with hand-written NEON specializations and measures the
+end-to-end impact. All numbers below are first-hand on this machine
+(8 × Cortex-A78AE @ 1.984 GHz).
+
+### §9.1 — Task #1: per-segment µs instrumentation
+
+Bracketed each shard_worker iteration into 6 segments with `rdtsc_now()`,
+accumulated in per-shard relaxed atomics, exposed via slots [16..27] of
+`s01g_snapshot_stats` (32-slot contract; see
+`src/lib_stage01_to_gpu.cpp::s01g_snapshot_stats`). Python side bumped to
+`(c_double * 32)`. Per-segment break-down printed by `hybrid_runner.py`.
+
+Per-event µs at 4 shards, synthetic 0.5 Mev/s, 14 s (baseline, pre-NEON):
+
+|             segment |   mean µs |       count | share% |
+|--------------------:|----------:|------------:|-------:|
+|          preprocess |     0.059 |   8 931 987 |   0.9% |
+| **stage_forward(0)**|   **3.938** | 8 931 986 | **57.1%** |
+|   tdrop_and_pool(0) |     0.076 |   7 770 726 |   1.0% |
+| **stage_forward(1)**|  **12.878** | 1 943 141 | **40.6%** |
+|   tdrop_and_pool(1) |     0.071 |   1 943 141 |   0.2% |
+|           ring push |     0.303 |     485 915 |   0.2% |
+
+99.7 % of CPU time is in `stage_forward(0)` + `stage_forward(1)`.
+Everything else is < 1 % — not worth touching. Instrumentation overhead
+(7× rdtsc + atomics per event ≈ 270 ns/event = 4 % of budget) is
+absorbed into the brackets.
+
+### §9.2 — Task #2: microbench scalar vs hand-NEON matvec_ct<12, 36>
+
+`tests/bench_matvec12.cpp`, 10M iterations, pinned to core 4 via
+`taskset`. Data dependency (`x[i & 7] = y[i & 0x1f] * 1e-7f`) prevents
+the compiler from hoisting.
+
+| implementation                       | ns / call | vs scalar | max\|Δ\| vs scalar |
+|--------------------------------------|----------:|----------:|-------------------:|
+| scalar `matvec_ct<12, 36>` (vendored)| 148.31    | 1.00×     | —                  |
+| NEON 1-out (across-IN + faddp reduce)|  92.88    | **1.60×** | 1.4e-7             |
+| **NEON 4-out ILP** (paired vpaddq)   | **50.68** | **2.93×** | 1.2e-7             |
+
+The 4-output variant computes 4 outputs in parallel through 4 independent
+FMA accumulator chains (matches A78AE's 4-pipe FP back-end), then folds
+horizontal reduce into 3 `vpaddq` instructions (vs 8 `faddp` in the per-
+output version). Per output cost: 3 vfmaq + 0.75 vpaddq + 0.25 vst1q.
+
+### §9.3 — Task #3: NEON specialization wired into ssla_kernels
+
+`include/ssla_neon_linear.h` (new): explicit specializations of
+`openeva::prim::matvec_ct<12, OUT>` for OUT ∈ {24, 36, 72} and
+`matvec_accum_ct<12, 12>`, all delegating to a single
+`matvec_in12_neon_core<OUT, Accumulate>` template. Included from
+`src/ssla_kernels.cpp` after `openeva/prim/linear.h` (primary templates
+must be visible first); ODR-safe because specialisations are `inline`.
+
+`vendor/openeva/prim/linear.h` is untouched — upstream drift = 0.
+
+Disassembly of `libstage01_to_gpu.so` per-lambda, before vs after
+(NEON 4-wide FMA-class = `fmla.4s` + `fmul.4s`; horiz reduce = `addp v_.4s`):
+
+| lambda           | scalar fmadd (before → after) | vec FMA-class (before → after) | paired-add (after) |
+|------------------|------------------------------:|-------------------------------:|-------------------:|
+| `<2, 12>`        | 23 → 12                       | 18 → **54**                    | 9                  |
+| `<12, 12>`       | **26 → 4**                    | **0 → 48**                     | **12**             |
+| `<12, 24>`       | 15 → 4                        | 12 → **24**                    | 7                  |
+| `<24, 24>`       | 4 → 4 (unchanged)             | 30 → 30 (unchanged)            | 10                 |
+
+`<12, 12>` (the every-event bottleneck) went from fully scalar to fully
+vectorised. `<24, 24>` correctly unchanged (already vectorised, not in
+the specialization set). `<2, 12>` and `<12, 24>` picked up shared
+specialisations (`matvec_accum_ct<12, 12>` and `matvec_ct<12, *>` qvg).
+
+### §9.4 — Task #5: P1 correctness gate
+
+`python3 orin/bench_s2_s3_head_celled.py --n 200000`:
+
+```
+Drop counts:  cpu_pass_s2=50124, gpu_pass_s2=50124  (drift=0.0000)
+             cpu_pass_s3=12562, gpu_pass_s3=12562  (drift=0.0000)
+s3_feat diff: max|Δ| = 4.4 over 12562 matched events
+P1 PASS — drop drift ≤ 0.005, max|Δ| ≤ 5.0
+```
+
+max\|Δ\| identical to the pre-NEON baseline (4.4) — confirming the
+NEON specialization's per-call ~1e-7 perturbation is dominated by the
+GPU kernel's accumulation-order noise (also fp32). No drift introduced.
+
+### §9.5 — Task #6: post-NEON per-event timing and shard sweep
+
+Same setup as §9.1 (4 shards, synthetic 0.5 Mev/s, 14 s):
+
+|             segment |  pre-NEON µs | post-NEON µs | speedup |
+|--------------------:|-------------:|-------------:|--------:|
+|          preprocess |        0.059 |        0.060 |     —   |
+| **stage_forward(0)**|     **3.938** |     **1.833** | **2.15×** |
+|   tdrop_and_pool(0) |        0.076 |        0.070 |     —   |
+| **stage_forward(1)**|    **12.878** |     **9.498** | **1.36×** |
+|   tdrop_and_pool(1) |        0.071 |        0.072 |     —   |
+|           ring push |        0.303 |        0.256 |     —   |
+
+s0 dropped 2.15× — bigger than the 1.6× microbench number, because the
+specialization replaces `matvec_ct<12, 36>` AND `matvec_accum_ct<12, 12>`
+across 9 patches per event (s0 L1) plus the same in s0 L0's gather.
+s1 also gained 1.36× (s1 L0 uses `matvec_ct<12, 24>` and `<12, 72>`
+specialisations; s1 L1 `<24, 24>` is unchanged).
+
+Post-share rebalance: s0 = 45 %, s1 = 51 % of CPU time. Stage 1 has now
+become the larger share. Further NEON work would target the `<24, *>`
+matvecs (already vectorised — diminishing returns) or `lru_step<24>` /
+`layernorm_ct<*>` (not yet attempted; see "Next" below).
+
+Saturation sweep, synthetic 2.0 Mev/s, 12 s each. Steady-state admit
+from 8 s–10 s window. `(*)` rows back-pressured by GPU ring overflow
+(CPU outpaces GPU drain after NEON; the CPU admit number is still the
+true CPU throughput because ring push has no back-pressure — see
+§9.6):
+
+| n_shards | pre-NEON Mev/s | **post-NEON Mev/s** | speedup | kev/s / shard |
+|---------:|---------------:|--------------------:|--------:|--------------:|
+| 1        | 0.135          | **0.216**           | 1.60×   | 216           |
+| 2        | 0.264          | **0.407**           | 1.54×   | 204           |
+| 4        | 0.494          | **0.781**           | 1.58×   | 195           |
+| 5        | 0.602          | **0.960**           | 1.59×   | 192           |
+| 6        | 0.677          | **1.089** `(*)`     | 1.61×   | 182           |
+| 7        | 0.764          | **1.304** `(*)`     | 1.71×   | 186           |
+| 8        | 0.821          | **1.310** `(*)`     | 1.60×   | 164           |
+
+**CPU side ceiling: 1.30 Mev/s at n_shards = 7**. n=8 doesn't gain
+further — 7 worker cores + 1 dispatcher/Python core saturates the
+8-core Orin NX 16 GB. Per-shard speedup stays near 1.59× across the
+full sweep, confirming the NEON gain is per-event, not configuration-
+specific. Per-shard efficiency degrades to 76 % at n=8 (164 vs 216
+kev/s/shard) — halo overhead grows as strip width shrinks (80 / n_shards px
+strip → halo zone 4 / strip px wider in fraction).
+
+### §9.6 — Note on `(*)` rows / GPU back-pressure
+
+After NEON, CPU push rate at n ≥ 4 exceeds GPU drain (~47 kev/s agg per
+§8.2). The current `lib_stage01_to_gpu.cpp::shard_worker` performs
+`__atomic_fetch_add(ring_head)` then writes to `ring_buf + (slot & mask)`
+without any check that the GPU has caught up — so when head − done >
+ring_capacity (16 k slots) the CPU overwrites pending records and the
+GPU kernel, reading garbage, eventually stalls (P2 FAIL on `done` count
+plateauing while `head` keeps climbing). This is a GPU-side / ring-
+protocol issue, intentionally out of scope per the user's directive
+("push the CPU side, don't worry about GPU"). The CPU admit numbers
+reported in the table are valid because the ring-push path is non-
+blocking in the current code; the cam_in / duration ratio reflects
+real synthetic-reader throughput.
+
+### §9.7 — Headline (Phase 1 CPU NEON)
+
+- **CPU per-shard rate**: 135 → 216 kev/s/shard (**1.60×**).
+- **CPU ceiling (max sustained admit)**: 0.82 Mev/s @ n=8 → **1.30 Mev/s @ n=7** (**1.60×**).
+- **Per-event s0**: 3.94 → 1.83 µs (2.15×).
+- **Per-event s1**: 12.88 → 9.50 µs (1.36×).
+- **Source delta**: 1 new header (`include/ssla_neon_linear.h`, ~130 LOC),
+  1-line include in `src/ssla_kernels.cpp`. No edits to `vendor/`.
+- **P1 numerics**: drift = 0, max\|Δ\| = 4.4 (unchanged from baseline).
+
+### §9.8 — Reproduction
+
+```bash
+cmake --build build -j
+python3 tools/make_ssla_stub.py /tmp/ssla_s_64x80/ --h 64 --w 80
+
+# P1 gate
+python3 orin/bench_s2_s3_head_celled.py --n 200000
+
+# matvec microbench
+taskset -c 4 build/bench_matvec12
+
+# Saturation sweep
+cd orin && for N in 1 2 4 5 6 7 8; do
+  python3 hybrid_runner.py --weights /tmp/ssla_s_64x80 \
+    --h-full 64 --w-full 80 --kernel-variant celled \
+    --synthetic-mev 2.0 --duration-s 12 --stats-interval-s 2 --shards $N
+done
+```
+
+### §9.9 — Next levers (not yet pursued)
+
+The CPU ceiling is now core-count bound (n=8 ≈ n=7). Three remaining
+levers, each in diminishing-returns territory unless paired with GPU
+work that lets us sustain the higher admit:
+
+1. **`lru_step<24>` / `layernorm_ct<*>` NEON** (Task #4 in plan, skipped):
+   stage 1 is now 51 % of CPU time. Disassembly shows residual 4
+   scalar fmadd in `<24, 24>` come from these primitives. Estimated
+   5–10 % per-event win on s1. Would push ceiling to ~1.4 Mev/s.
+
+2. **Halo broadcast reduction**: each event near a strip boundary
+   currently runs s0 in 2 shards. Routing by sub-cell with cross-
+   shard state sync would eliminate the duplicate s0. Estimated
+   10–15 % CPU saving. Requires re-introducing the per-patch lock
+   primitives (`layer_forward_locked` in `ssla_kernels.cpp:142`) that
+   were retired. Bigger surgery.
+
+3. **GPU drain lift (option B from prior plan)**: BATCH 8 → 4 in the
+   celled kernel doubles GPU drain ceiling, lifting the system-level
+   admit ceiling above 1.3 Mev/s (currently capped by the ring-
+   overflow issue noted in §9.6, not by CPU). Out of scope here.

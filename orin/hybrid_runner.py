@@ -431,6 +431,9 @@ def main() -> int:
     # ---- 7. Shutdown ---------------------------------------------------
     print("[main] stopping camera thread ...", flush=True)
     cam_thread.join(timeout=2.0)
+    # Snapshot per-segment timing BEFORE shutdown — api.stats() requires
+    # the lib handle which shutdown destroys.
+    final_stats = api.stats()
     print("[main] setting GPU stop_flag ...", flush=True)
     _write_i32(stop_flag, 1)
     # Wait for kernel to exit.
@@ -460,6 +463,22 @@ def main() -> int:
     print(f"[final] predictions:  block 1 nonzero={pred_nonzero[1]}  "
           f"cells_written={pred_nz_cells[1]}/{version_view[1].size}  "
           f"total_writes={pred_total_writes[1]}")
+
+    # Per-segment CPU timing breakdown (Task #1). Slots 16..21 are sum_ns
+    # summed across shards; 22..27 are call counts. mean_us = sum_ns /
+    # count / 1000. See src/lib_stage01_to_gpu.cpp::s01g_snapshot_stats.
+    seg_names = ["preprocess", "stage_forward(0)", "tdrop_and_pool(0)",
+                 "stage_forward(1)", "tdrop_and_pool(1)", "ring push"]
+    print(f"\n[cpu seg] per-segment mean (sum across shards):")
+    print(f"  {'segment':>20} | {'mean_us':>10}  {'count':>12}  "
+          f"{'share_%':>8}")
+    seg_sum_ns = [final_stats[16 + s] for s in range(6)]
+    seg_cnt    = [int(final_stats[22 + s]) for s in range(6)]
+    total_ns = sum(seg_sum_ns)
+    for name, sn, cn in zip(seg_names, seg_sum_ns, seg_cnt):
+        mean_us = (sn / cn / 1000.0) if cn > 0 else 0.0
+        share = (sn / total_ns * 100.0) if total_ns > 0 else 0.0
+        print(f"  {name:>20} | {mean_us:10.3f}  {cn:12d}  {share:7.1f}%")
 
     # GPU latency: per-event clock64 deltas, converted to ns assuming
     # SM clock 918 MHz. Filter to slots with non-zero t_done_clk (slot 0

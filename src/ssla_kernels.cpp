@@ -22,6 +22,13 @@
 #include "openeva/prim/rnn.h"
 #include "src/weights_loader.h"
 
+// NEON specializations for matvec_ct / matvec_accum_ct at IN=12. Must come
+// after openeva/prim/linear.h (primary templates must be declared first) and
+// before any layer_forward_ct<…> instantiation in this TU. The instantiations
+// happen below in stage_forward() — keeping this include here covers all of
+// them. See include/ssla_neon_linear.h for rationale and microbench data.
+#include "ssla_neon_linear.h"
+
 namespace deploy {
 
 namespace {
