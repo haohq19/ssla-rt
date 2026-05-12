@@ -181,22 +181,22 @@ python3 bench_s2_s3_head_celled.py --n 200000
 
 See `orin/STATUS.md` §§6–7 for current passing numbers.
 
-## 6. Headline measurements (as of 2026-05-12; see STATUS.md §9 for the CPU NEON layer that supersedes §8's CPU numbers)
+## 6. Headline measurements (as of 2026-05-12; see STATUS.md §10 for Phase 3 fused interior layers — supersedes §9)
 
-| metric | legacy | **current (post-NEON)** | speedup vs legacy |
-|---|---:|---:|---:|
-| GPU drain saturation (live persistent kernel) | 5 kev/s | **~47 kev/s agg** | **9.4×** |
-| owner-pass-3 p50 | 530 µs | **127 µs** | **4.2×** |
-| owner-pass-3 p99 | 1.8 ms | **310 µs** | **5.8×** |
-| Per-event stage_forward(0) on CPU | 3.94 µs | **1.83 µs** | **2.15×** (§9) |
-| Per-event stage_forward(1) on CPU | 12.88 µs | **9.50 µs** | **1.36×** (§9) |
-| CPU admit per shard | 135 kev/s | **216 kev/s** | **1.60×** (§9) |
-| **CPU side ceiling** (max sustained admit) | 0.82 Mev/s @ n=8 | **1.30 Mev/s @ n=7** | **1.60×** (§9) |
+| metric | legacy | Phase 1+2 (matvec+lru NEON) | **Phase 3 (fused layers)** | total vs legacy |
+|---|---:|---:|---:|---:|
+| GPU drain saturation (live persistent kernel) | 5 kev/s | ~47 kev/s | ~47 kev/s | 9.4× |
+| owner-pass-3 p50 | 530 µs | 127 µs | 127 µs | 4.2× |
+| Per-event stage_forward(0) on CPU | 3.94 µs | 1.83 µs | **1.05 µs** | **3.75×** |
+| Per-event stage_forward(1) on CPU | 12.88 µs | 9.50 µs | **5.34 µs** | **2.41×** |
+| CPU per-shard rate | 135 kev/s | 216 kev/s | **327 kev/s @ n=4** | **2.42×** |
+| **CPU ceiling stable** | 0.82 Mev/s @ n=8 | 1.30 Mev/s @ n=7 | **1.85 Mev/s @ n=6** | **2.26×** |
+| **CPU ceiling burst** | — | — | **~2.0 Mev/s @ n=8** | **2.44×** |
 
-CPU side now exceeds the 1 Mev/s design target. GPU drain ceiling (~0.6 Mev/s
-admit-equivalent) is the binding system-level limit; the CPU can produce more
-than the GPU can drain. Path past 1 Mev/s end-to-end requires GPU-side work
-(e.g. BATCH 8→4 → 2 blocks/SM).
+CPU side now exceeds the 1 Mev/s design target by 1.85–2.0×. GPU drain ceiling
+(~0.6 Mev/s admit-equivalent) is the binding system-level limit; the CPU can
+produce more than 3× what the GPU can drain. Path past 0.6 Mev/s end-to-end
+requires GPU-side work (e.g. BATCH 8→4 → 2 blocks/SM).
 
 ## 7. Cross-references
 

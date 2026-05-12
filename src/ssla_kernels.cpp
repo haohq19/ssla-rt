@@ -29,6 +29,16 @@
 // them. See include/ssla_neon_linear.h for rationale and microbench data.
 #include "ssla_neon_linear.h"
 
+// NEON specializations for lru_step<DIM> at DIM ∈ {12, 24, 48, 96}. Same
+// rule as ssla_neon_linear: include AFTER vendor/openeva/prim/rnn.h. See
+// include/ssla_neon_lru.h for the tanh-Padé sigmoid + drift verification.
+#include "ssla_neon_lru.h"
+
+// Fused interior-only kernels for s0 L1, s1 L0, s1 L1 (Phase 3). Used by
+// stage_forward below when ev_x/ev_y are interior; falls back to the
+// generic layer_forward_ct on boundary pixels.
+#include "ssla_fused_layers.h"
+
 namespace deploy {
 
 namespace {
@@ -721,14 +731,49 @@ void SslaSPipeline::stage_forward(int stage, int ev_x, int ev_y,
     // boundaries. The intermediate buffer between the two layers is the
     // per-stage scratch (stage_out_[stage] reused as a temp).
     float* tmp = stage_out_[stage].data();
+    const int Wl = Ws_[stage];
+    const int Hl = Hs_[stage];
+    const bool interior = (ev_x > 0) && (ev_x + 1 < Wl)
+                       && (ev_y > 0) && (ev_y + 1 < Hl);
     switch (stage) {
         case 0:
             layer_forward_ct<kInDim, kC0>(0, ev_x, ev_y, feat_in, tmp);
-            layer_forward_ct<kC0,    kC0>(1, ev_x, ev_y, tmp,    feat_out);
+            // s0 L1: fused interior path (1.09× over generic in microbench).
+            if (interior) {
+                const auto& L1 = layers_[1];
+                fused::s0_l1_interior(
+                    ev_x, ev_y, Wl, tmp,
+                    L1.qvgIn, L1.goW,
+                    L1.ln_gamma.data(), L1.ln_beta.data(),
+                    hidden_[1].data(), feat_out);
+            } else {
+                layer_forward_ct<kC0, kC0>(1, ev_x, ev_y, tmp, feat_out);
+            }
             break;
         case 1:
-            layer_forward_ct<kC0, kC1>(2, ev_x, ev_y, feat_in, tmp);
-            layer_forward_ct<kC1, kC1>(3, ev_x, ev_y, tmp,    feat_out);
+            // s1 L0: fused interior path (1.30×). Has input_proj for residual.
+            if (interior) {
+                const auto& L0 = layers_[2];
+                fused::s1_l0_interior(
+                    ev_x, ev_y, Wl, feat_in,
+                    L0.input_proj.empty() ? nullptr : L0.input_proj.data(),
+                    L0.qvgIn, L0.goW,
+                    L0.ln_gamma.data(), L0.ln_beta.data(),
+                    hidden_[2].data(), tmp);
+            } else {
+                layer_forward_ct<kC0, kC1>(2, ev_x, ev_y, feat_in, tmp);
+            }
+            // s1 L1: fused interior path (1.49×).
+            if (interior) {
+                const auto& L1 = layers_[3];
+                fused::s1_l1_interior(
+                    ev_x, ev_y, Wl, tmp,
+                    L1.qvgIn, L1.goW,
+                    L1.ln_gamma.data(), L1.ln_beta.data(),
+                    hidden_[3].data(), feat_out);
+            } else {
+                layer_forward_ct<kC1, kC1>(3, ev_x, ev_y, tmp, feat_out);
+            }
             break;
         case 2:
             layer_forward_ct<kC1, kC2>(4, ev_x, ev_y, feat_in, tmp);
@@ -740,6 +785,22 @@ void SslaSPipeline::stage_forward(int stage, int ev_x, int ev_y,
             break;
         default:
             throw std::out_of_range("ssla_kernels: stage out of range");
+    }
+}
+
+void SslaSPipeline::layer_forward(int layer_idx, int ev_x, int ev_y,
+                                   const float* feat_in, float* feat_out) {
+    switch (layer_idx) {
+        case 0: layer_forward_ct<kInDim, kC0>(0, ev_x, ev_y, feat_in, feat_out); break;
+        case 1: layer_forward_ct<kC0,    kC0>(1, ev_x, ev_y, feat_in, feat_out); break;
+        case 2: layer_forward_ct<kC0,    kC1>(2, ev_x, ev_y, feat_in, feat_out); break;
+        case 3: layer_forward_ct<kC1,    kC1>(3, ev_x, ev_y, feat_in, feat_out); break;
+        case 4: layer_forward_ct<kC1,    kC2>(4, ev_x, ev_y, feat_in, feat_out); break;
+        case 5: layer_forward_ct<kC2,    kC2>(5, ev_x, ev_y, feat_in, feat_out); break;
+        case 6: layer_forward_ct<kC2,    kC3>(6, ev_x, ev_y, feat_in, feat_out); break;
+        case 7: layer_forward_ct<kC3,    kC3>(7, ev_x, ev_y, feat_in, feat_out); break;
+        default:
+            throw std::out_of_range("ssla_kernels: layer_idx out of range");
     }
 }
 

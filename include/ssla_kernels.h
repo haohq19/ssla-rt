@@ -89,6 +89,33 @@ public:
     void stage_forward(int stage, int ev_x, int ev_y,
                        const float* feat_in, float* feat_out);
 
+    // Bench-only public accessor for per-layer weight buffers. Used by
+    // tests/bench_fused.cpp to compare the generic layer_forward against a
+    // hand-fused interior kernel. Not part of the runtime contract.
+    const LayerWeights& bench_layer_weights(int layer_idx) const {
+        return layers_[layer_idx];
+    }
+    int bench_Wl(int stage) const { return Ws_[stage]; }
+    int bench_Hl(int stage) const { return Hs_[stage]; }
+    float* bench_hidden(int layer_idx) { return hidden_[layer_idx].data(); }
+
+    // Single-layer forward. Like stage_forward, but evaluates exactly one
+    // SSLA layer specified by global layer index (0..7).
+    //   layer_idx | (IN,  OUT) | stage / role
+    //   --------- + ---------- + --------------
+    //         0   | ( 2, 12)   | stage 0 L0
+    //         1   | (12, 12)   | stage 0 L1
+    //         2   | (12, 24)   | stage 1 L0
+    //         3   | (24, 24)   | stage 1 L1
+    //         4   | (24, 48)   | stage 2 L0
+    //         5   | (48, 48)   | stage 2 L1
+    //         6   | (48, 96)   | stage 3 L0
+    //         7   | (96, 96)   | stage 3 L1
+    // Used by tests/bench_layer.cpp to time individual layers in isolation.
+    // Production runtime path uses stage_forward instead.
+    void layer_forward(int layer_idx, int ev_x, int ev_y,
+                       const float* feat_in, float* feat_out);
+
     // -------- Sharded layer-forward primitives (S3) --------
     //
     // SHARDED STAGE 0 ONLY (other stages run single-threaded in S3 since

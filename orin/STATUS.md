@@ -1506,3 +1506,128 @@ work that lets us sustain the higher admit:
    celled kernel doubles GPU drain ceiling, lifting the system-level
    admit ceiling above 1.3 Mev/s (currently capped by the ring-
    overflow issue noted in §9.6, not by CPU). Out of scope here.
+
+## §10 — Fused interior layer kernels (2026-05-12, Phase 3)
+
+Phase 3 follows external expert review of §9.7. The expert's hypothesis
+(fused, hand-NEON, fully-unrolled interior kernels for s0 L1, s1 L0,
+s1 L1 should beat the current generic path by ≥5%) was tested
+end-to-end and validated by direct measurement, but with one
+non-obvious implementation pitfall.
+
+### §10.1 — The qvg[18] stack-array pitfall
+
+First fused attempt used `float32x4_t qvg[18]` as a stack array, on the
+theory that 18 NEON vectors fit in 32 architectural registers. Result:
+**0.96× — slower than the generic path by 4%.** Disassembly showed
+GCC treated indexed access into the stack array as memory (load+store
+each access) and spilled aggressively.
+
+Working version requires three things together:
+1. **18 named local variables** (`float32x4_t qvg0, qvg1, …, qvg17`)
+   instead of `qvg[18]`. Compiler tracks lifetime per-variable for
+   register allocation.
+2. **`__attribute__((always_inline))`** on the per-patch helper. Without
+   it, GCC's heuristic may decline inlining a 600+ line function body,
+   defeating the register-reuse intent.
+3. **Manual lru chunk unroll** (6 explicit chunk blocks) — a `for (int
+   b = 0; b < 6; ++b)` loop with `qvg[12+b]` runtime indexing again
+   forces memory.
+
+After these three fixes:
+
+```text
+                                  generic    fused      speedup
+  s0 L1 <12, 12>  (820 ns        822.4   →   752.2 ns    1.09×)
+  s1 L0 <12, 24>  (2223 ns       2223.3  →  1712.4 ns    1.30×)
+  s1 L1 <24, 24>  (4184 ns       4183.9  →  2799.0 ns    1.49×)
+  max|Δ| feat_out vs generic: 0 / 2.4e-7 / 2.4e-7 (single call)
+```
+
+`tests/bench_fused.cpp` reproduces. Fused header is
+`include/ssla_fused_layers.h`; production dispatch is in
+`src/ssla_kernels.cpp::stage_forward` (interior path only — boundary
+pixels fall back to the generic `layer_forward_ct`).
+
+### §10.2 — Per-event µs after Phase 3 (4 shards, synthetic 0.5 Mev/s)
+
+```text
+            segment   Phase 2    Phase 3    delta
+   ────────────────────────────────────────────────
+         preprocess     0.060     0.059      -1.7%
+   stage_forward(0)     1.112     1.048      -5.8%
+    tdrop_and_pool0     0.087     0.072      -17.2%
+   stage_forward(1)     6.789     5.335      -21.4%  ★ biggest win
+    tdrop_and_pool1     0.082     0.077      -6.1%
+          ring push     0.256     0.258      +0.8%
+```
+
+s0 dropped 5.8 % (matches the s0 L1 1.09× microbench gain on the L1
+sub-piece — L0 is unchanged at ~117 ns). s1 dropped 21.4 % (both L0 and
+L1 fused — weighted average of the 1.30× and 1.49× wins).
+
+### §10.3 — Saturation sweep (synthetic 3.0 Mev/s submit, 12 s each)
+
+Steady-state admit from the 8 s–10 s 2-s window:
+
+| n_shards | Phase 2 (Mev/s) | **Phase 3 (Mev/s)** | speedup | notes |
+|---:|---:|---:|---:|---|
+| 1 | 0.296 | **0.336** | 1.14× | stable |
+| 2 | 0.593 | **0.663** | 1.12× | stable |
+| 4 | 1.137 | **1.307** | 1.15× | stable |
+| 5 | 1.379 | **1.578** | 1.14× | stable |
+| **6** | 1.562 | **1.853** | **1.19×** | **stable — best confidence** ★ |
+| 7 | 1.694 | 1.644       | 0.97× | unstable (window variance) |
+| 8 | 1.638 | **2.005 avg** | 1.22× | **2 Mev/s target hit, window 1.87-2.14** |
+
+n=7 going down vs n=6 is an artefact of the saturation regime: at very
+high per-shard rate, dispatcher push + ring atomic_fetch_add contention
+becomes window-sensitive. n=8 is unstable for the same reason but the
+4-window average over 10 s is ~2.0 Mev/s. n=6 at 1.85 Mev/s is the
+reliable stable point.
+
+### §10.4 — P1 numerics
+
+`bench_s2_s3_head_celled.py --n 200000`: drift = 0, max\|Δ\| = 4.4 —
+**unchanged from baseline through all three NEON rounds.** The fused
+kernel's per-call max\|Δ\| of 2.4e-7 is dominated by the GPU kernel's
+own fp32-accumulation noise (also unchanged). Note that the standard
+P1 gate does NOT exercise the C++ CPU pipeline (it tests the GPU
+kernel against a Python NumPy oracle), so this is a "no regression"
+signal rather than a positive correctness proof of the fused C++.
+Per-call fp32 noise on cumulative h-state drift through the 200k
+recurrence remains bounded by the bench_sigmoid Phase 2 measurement
+(0.009 over 200k steps).
+
+### §10.5 — Headline (Phase 3 alone, fused interior layers)
+
+- Per-event s0: 1.11 → **1.05 µs** (1.06×).
+- Per-event s1: 6.79 → **5.34 µs** (1.27×).
+- CPU per-shard rate: 296 → **327 kev/s** (@ n=4, 1.10×).
+- CPU stable ceiling: 1.69 → **1.85 Mev/s** (@ n=6, 1.09×).
+- CPU burst average: **~2.0 Mev/s** @ n=8 (window 1.87–2.14).
+- Source delta: 1 new header (`include/ssla_fused_layers.h`, ~480 LOC
+  with `always_inline` per-patch helpers using named float32x4_t locals
+  and three macro-unrolled phases per patch); ~20 lines added to
+  `src/ssla_kernels.cpp::stage_forward` for interior-vs-boundary
+  dispatch. No edits to `vendor/`.
+
+### §10.6 — Cumulative across all three Phases (baseline → Phase 3)
+
+| metric | baseline | Phase 1 | Phase 2 | **Phase 3** | total |
+|---|---:|---:|---:|---:|---:|
+| per-event s0 µs | 3.94 | 1.83 | 1.11 | **1.05** | **3.75×** |
+| per-event s1 µs | 12.88 | 9.50 | 6.79 | **5.34** | **2.41×** |
+| per-shard rate (n=4) kev/s | 124 | 195 | 284 | **327** | **2.64×** |
+| CPU stable ceiling Mev/s | 0.82 | 1.30 | 1.69 | **1.85** | **2.26×** |
+| CPU burst Mev/s | 0.82 | 1.30 | 1.69 | **~2.00** | **2.44×** |
+| P1 max\|Δ\| | 4.4 | 4.4 | 4.4 | **4.4** | unchanged |
+
+Three NEON rounds (Phase 1 matvec specialisations at IN=12, Phase 2
+lru_step sigmoid via tanh-Padé, Phase 3 fused interior layers) cleared
+2.0 Mev/s on average at n=8 and 1.85 Mev/s stable at n=6. CPU side is
+now well past the 1 Mev/s design target; further admit gain is bounded
+by hardware (8 cores total) and by GPU drain (~0.6 Mev/s admit-equiv)
+becoming the system-level limit. fp16 (`asimdhp`) and int8 (`asimddp`)
+remain available but are out of scope due to numeric risk in the
+recurrent fp32 graph.

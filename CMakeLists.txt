@@ -60,6 +60,25 @@ target_link_libraries(oracle_diff PRIVATE Threads::Threads)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   add_executable(bench_matvec12 tests/bench_matvec12.cpp)
   target_link_libraries(bench_matvec12 PRIVATE openeva_vendor)
+
+  # Per-layer + per-primitive bench. Drives Phase 2 profiling decisions.
+  add_executable(bench_layer tests/bench_layer.cpp)
+  target_link_libraries(bench_layer PRIVATE ssla_kernels openeva_vendor)
+
+  # Sigmoid: scalar vs NEON polynomial approximations. Accuracy + speed.
+  add_executable(bench_sigmoid tests/bench_sigmoid.cpp)
+  target_link_libraries(bench_sigmoid PRIVATE openeva_vendor)
+
+  # matvec for IN=24: GCC auto-vec vs hand-NEON 4-out ILP. Drives Phase 3
+  # decision on whether to specialize stage-1 matvec sizes too.
+  add_executable(bench_matvec24 tests/bench_matvec24.cpp)
+  target_link_libraries(bench_matvec24 PRIVATE openeva_vendor)
+
+  # Fused layer kernel test (expert proposal). Compares the current generic
+  # layer_forward_ct<24, 24> against a hand-fused interior-only kernel that
+  # keeps qvg/qh in NEON registers across matvec → lru → matvec_accum.
+  add_executable(bench_fused tests/bench_fused.cpp)
+  target_link_libraries(bench_fused PRIVATE ssla_kernels openeva_vendor)
 endif()
 
 # ---- CPU pipeline shared libs (Python callers via ctypes) -------------------
