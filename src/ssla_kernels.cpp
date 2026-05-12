@@ -772,24 +772,24 @@ void SslaSPipeline::stage_forward(int stage, int ev_x, int ev_y,
             }
             break;
         case 1:
-            // s1 L0: fused interior path (1.30×). Has input_proj for residual.
+            // s1 L0: tile-streaming fused interior path (Phase 6, goW_T layout).
             if (interior) {
                 const auto& L0 = layers_[2];
-                fused::s1_l0_interior(
+                fused::s1_l0_interior_tiled(
                     ev_x, ev_y, Wl, feat_in,
                     L0.input_proj.empty() ? nullptr : L0.input_proj.data(),
-                    L0.qvgIn, L0.goW,
+                    L0.qvgIn, L0.goW_T,
                     L0.ln_gamma.data(), L0.ln_beta.data(),
                     hidden_[2].data(), tmp);
             } else {
                 layer_forward_ct<kC0, kC1>(2, ev_x, ev_y, feat_in, tmp);
             }
-            // s1 L1: fused interior path (1.49×).
+            // s1 L1: tile-streaming fused interior path (Phase 6, goW_T layout).
             if (interior) {
                 const auto& L1 = layers_[3];
-                fused::s1_l1_interior(
+                fused::s1_l1_interior_tiled(
                     ev_x, ev_y, Wl, tmp,
-                    L1.qvgIn, L1.goW,
+                    L1.qvgIn, L1.goW_T,
                     L1.ln_gamma.data(), L1.ln_beta.data(),
                     hidden_[3].data(), feat_out);
             } else {

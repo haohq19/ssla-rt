@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "ssla_kernels.h"
+#include "ssla_fused_layers.h"  // for fused::s1_l1_interior_tiled etc.
 
 namespace {
 
@@ -577,6 +578,11 @@ int main(int argc, char** argv) {
 
     // ---- equivalence: same input → max|Δ| feat_out ------------------------
     pipe.layer_forward(3, 5, 5, feat_in, feat_out_g);
+    // Save (5,5) reference output for later tile-streaming comparison.
+    // The bench loops below reuse feat_out_g across rotating (x,y), so its
+    // contents after the loop reflect the last iter's coordinate, not (5,5).
+    alignas(16) float feat_out_g_at_5_5[24];
+    std::memcpy(feat_out_g_at_5_5, feat_out_g, sizeof(feat_out_g_at_5_5));
     std::memcpy(H_all, H_snap.data(), H_snap.size() * sizeof(float));
 
     layer_forward_s1_l1_fused_interior(
@@ -639,6 +645,209 @@ int main(int argc, char** argv) {
     std::printf("  generic (pipe.layer_forward) : %7.1f ns/call\n", ns_generic);
     std::printf("  fused hand-NEON              : %7.1f ns/call    %.2fx\n",
                 ns_fused, ns_generic / ns_fused);
+
+    // ---- bench tile-streaming s1_l1 (Phase 6) ----------------------------
+    std::memcpy(H_all, H_snap.data(), H_snap.size() * sizeof(float));
+    alignas(16) float feat_out_t[24];
+    deploy::fused::s1_l1_interior_tiled(
+        5, 5, Wl, feat_in, Lw.qvgIn, Lw.goW_T,
+        Lw.ln_gamma.data(), Lw.ln_beta.data(),
+        H_all, feat_out_t);
+    std::memcpy(H_all, H_snap.data(), H_snap.size() * sizeof(float));
+    float max_d_tiled = 0.f;
+    for (int i = 0; i < 24; ++i) {
+        const float d = std::fabs(feat_out_g_at_5_5[i] - feat_out_t[i]);
+        if (d > max_d_tiled) max_d_tiled = d;
+    }
+    std::printf("  tile-streaming max|Δ|         : %.3e\n", max_d_tiled);
+
+    // ========================================================================
+    // EXPERT TEST 2: ACCUM_TILE isolation with one-hot qh_tile.
+    // For each (t, k), set qh_tile = one_hot(k), out = 0, call ACCUM_TILE(t)
+    // logic, expect: out[0..23] = row (t*4+k) of goW_T (= column (t*4+k) of goW)
+    // ========================================================================
+    {
+        std::printf("\n=== EXPERT TEST 2: ACCUM_TILE one-hot isolation ===\n");
+        const float* goW_T_p = Lw.goW_T[4].data();   // pos=4 (center)
+        bool any_fail = false;
+        float global_max_err = 0.f;
+        for (int t = 0; t < 6; ++t) {
+            for (int k = 0; k < 4; ++k) {
+                alignas(16) float qh_arr[4] = {0.f, 0.f, 0.f, 0.f};
+                qh_arr[k] = 1.0f;
+                const float32x4_t qh_tile = vld1q_f32(qh_arr);
+
+                float32x4_t out0 = vdupq_n_f32(0.f);
+                float32x4_t out1 = vdupq_n_f32(0.f);
+                float32x4_t out2 = vdupq_n_f32(0.f);
+                float32x4_t out3 = vdupq_n_f32(0.f);
+                float32x4_t out4 = vdupq_n_f32(0.f);
+                float32x4_t out5 = vdupq_n_f32(0.f);
+
+                // ACCUM_TILE(t) inlined — same code as in patch_24_24_tiled
+                const float* gT0 = goW_T_p + (t * 4 + 0) * 24;
+                const float* gT1 = goW_T_p + (t * 4 + 1) * 24;
+                const float* gT2 = goW_T_p + (t * 4 + 2) * 24;
+                const float* gT3 = goW_T_p + (t * 4 + 3) * 24;
+                out0 = vfmaq_laneq_f32(out0, vld1q_f32(gT0 +  0), qh_tile, 0);
+                out0 = vfmaq_laneq_f32(out0, vld1q_f32(gT1 +  0), qh_tile, 1);
+                out0 = vfmaq_laneq_f32(out0, vld1q_f32(gT2 +  0), qh_tile, 2);
+                out0 = vfmaq_laneq_f32(out0, vld1q_f32(gT3 +  0), qh_tile, 3);
+                out1 = vfmaq_laneq_f32(out1, vld1q_f32(gT0 +  4), qh_tile, 0);
+                out1 = vfmaq_laneq_f32(out1, vld1q_f32(gT1 +  4), qh_tile, 1);
+                out1 = vfmaq_laneq_f32(out1, vld1q_f32(gT2 +  4), qh_tile, 2);
+                out1 = vfmaq_laneq_f32(out1, vld1q_f32(gT3 +  4), qh_tile, 3);
+                out2 = vfmaq_laneq_f32(out2, vld1q_f32(gT0 +  8), qh_tile, 0);
+                out2 = vfmaq_laneq_f32(out2, vld1q_f32(gT1 +  8), qh_tile, 1);
+                out2 = vfmaq_laneq_f32(out2, vld1q_f32(gT2 +  8), qh_tile, 2);
+                out2 = vfmaq_laneq_f32(out2, vld1q_f32(gT3 +  8), qh_tile, 3);
+                out3 = vfmaq_laneq_f32(out3, vld1q_f32(gT0 + 12), qh_tile, 0);
+                out3 = vfmaq_laneq_f32(out3, vld1q_f32(gT1 + 12), qh_tile, 1);
+                out3 = vfmaq_laneq_f32(out3, vld1q_f32(gT2 + 12), qh_tile, 2);
+                out3 = vfmaq_laneq_f32(out3, vld1q_f32(gT3 + 12), qh_tile, 3);
+                out4 = vfmaq_laneq_f32(out4, vld1q_f32(gT0 + 16), qh_tile, 0);
+                out4 = vfmaq_laneq_f32(out4, vld1q_f32(gT1 + 16), qh_tile, 1);
+                out4 = vfmaq_laneq_f32(out4, vld1q_f32(gT2 + 16), qh_tile, 2);
+                out4 = vfmaq_laneq_f32(out4, vld1q_f32(gT3 + 16), qh_tile, 3);
+                out5 = vfmaq_laneq_f32(out5, vld1q_f32(gT0 + 20), qh_tile, 0);
+                out5 = vfmaq_laneq_f32(out5, vld1q_f32(gT1 + 20), qh_tile, 1);
+                out5 = vfmaq_laneq_f32(out5, vld1q_f32(gT2 + 20), qh_tile, 2);
+                out5 = vfmaq_laneq_f32(out5, vld1q_f32(gT3 + 20), qh_tile, 3);
+
+                alignas(16) float out_arr[24];
+                vst1q_f32(out_arr +  0, out0);
+                vst1q_f32(out_arr +  4, out1);
+                vst1q_f32(out_arr +  8, out2);
+                vst1q_f32(out_arr + 12, out3);
+                vst1q_f32(out_arr + 16, out4);
+                vst1q_f32(out_arr + 20, out5);
+
+                // Expected: out = goW_T row (t*4+k) = 24 floats
+                const float* expected = goW_T_p + (t * 4 + k) * 24;
+                float max_e = 0.f;
+                int first_bad_i = -1;
+                for (int i = 0; i < 24; ++i) {
+                    const float d = std::fabs(out_arr[i] - expected[i]);
+                    if (d > max_e) { max_e = d; first_bad_i = (max_e > 1e-5f && first_bad_i < 0) ? i : first_bad_i; }
+                }
+                global_max_err = std::max(global_max_err, max_e);
+                if (max_e > 1e-5f) {
+                    any_fail = true;
+                    std::printf("  t=%d k=%d FAIL max|Δ|=%.3e  first_bad i=%d  out=%g  expected=%g\n",
+                                t, k, max_e, first_bad_i,
+                                out_arr[first_bad_i],
+                                expected[first_bad_i]);
+                }
+            }
+        }
+        if (!any_fail) {
+            std::printf("  All 24 (tile, lane) cases PASS, global max|Δ| = %.3e\n",
+                        global_max_err);
+        }
+    }
+
+    // ========================================================================
+    // EXPERT TEST 3: verify goW_T is correctly transposed for ALL 9 pos.
+    // ========================================================================
+    {
+        std::printf("\n=== goW_T transpose check, all 9 pos ===\n");
+        bool any_fail = false;
+        for (int p = 0; p < 9; ++p) {
+            const float* gW = Lw.goW[p].data();
+            const float* gW_T = Lw.goW_T[p].data();
+            float max_e = 0.f;
+            for (int j = 0; j < 24; ++j) {
+                for (int i = 0; i < 24; ++i) {
+                    const float expected = gW[j * 24 + i];
+                    const float actual   = gW_T[i * 24 + j];
+                    const float d = std::fabs(actual - expected);
+                    if (d > max_e) max_e = d;
+                }
+            }
+            if (max_e > 0.f) {
+                any_fail = true;
+                std::printf("  pos=%d max|Δ|=%.3e FAIL\n", p, max_e);
+            }
+        }
+        if (!any_fail) std::printf("  All 9 pos transposes EXACT match\n");
+    }
+
+    // ========================================================================
+    // EXPERT TEST 4 (hypothesis 1): strict harness isolation.
+    // Save H_all in TWO copies, run generic from H_ref and tiled from H_test,
+    // compare both feat_out AND post-call hidden state.
+    // ========================================================================
+    {
+        std::printf("\n=== EXPERT TEST 4: strict harness isolation ===\n");
+        std::vector<float> H_ref(H_snap), H_test(H_snap);
+        const size_t H_bytes = H_snap.size() * sizeof(float);
+
+        std::memcpy(H_all, H_ref.data(), H_bytes);
+        alignas(16) float feat_g[24], feat_t[24];
+        pipe.layer_forward(3, 5, 5, feat_in, feat_g);
+        std::memcpy(H_ref.data(), H_all, H_bytes);   // save mutated state
+
+        std::memcpy(H_all, H_test.data(), H_bytes);
+        deploy::fused::s1_l1_interior_tiled(
+            5, 5, Wl, feat_in, Lw.qvgIn, Lw.goW_T,
+            Lw.ln_gamma.data(), Lw.ln_beta.data(),
+            H_all, feat_t);
+        std::memcpy(H_test.data(), H_all, H_bytes);
+
+        // Compare feat_out
+        float max_feat_diff = 0.f;
+        for (int i = 0; i < 24; ++i)
+            max_feat_diff = std::max(max_feat_diff, std::fabs(feat_g[i] - feat_t[i]));
+        std::printf("  feat_out max|Δ|: %.3e\n", max_feat_diff);
+
+        // Compare hidden state at touched cells (the 9 patches)
+        const int base = 5 * Wl + 5;
+        constexpr int dx_arr[9] = {-1, 0, 1, -1, 0, 1, -1, 0, 1};
+        constexpr int dy_arr[9] = {-1, -1, -1, 0, 0, 0, 1, 1, 1};
+        float max_h_diff = 0.f;
+        int worst_cell = -1, worst_c = -1;
+        for (int k = 0; k < 9; ++k) {
+            const int patch_idx = base + dy_arr[k] * Wl + dx_arr[k];
+            for (int c = 0; c < 24; ++c) {
+                const float gv = H_ref[(size_t)patch_idx * 24 + c];
+                const float tv = H_test[(size_t)patch_idx * 24 + c];
+                const float d = std::fabs(gv - tv);
+                if (d > max_h_diff) {
+                    max_h_diff = d;
+                    worst_cell = patch_idx;
+                    worst_c = c;
+                }
+            }
+        }
+        std::printf("  hidden_state at 9 touched cells max|Δ|: %.3e",
+                    max_h_diff);
+        if (worst_cell >= 0) std::printf("  (cell %d, channel %d)",
+                                         worst_cell, worst_c);
+        std::printf("\n");
+    }
+
+    for (long long i = 0; i < N_WARMUP; ++i) {
+        const int x = 2 + (int)(i % (Wl - 4));
+        const int y = 2 + (int)((i / Wl) % (Hl - 4));
+        deploy::fused::s1_l1_interior_tiled(
+            x, y, Wl, feat_in, Lw.qvgIn, Lw.goW_T,
+            Lw.ln_gamma.data(), Lw.ln_beta.data(),
+            H_all, feat_out_t);
+    }
+    auto t4 = std::chrono::steady_clock::now();
+    for (long long i = 0; i < N_ITERS; ++i) {
+        const int x = 2 + (int)(i % (Wl - 4));
+        const int y = 2 + (int)((i / Wl) % (Hl - 4));
+        deploy::fused::s1_l1_interior_tiled(
+            x, y, Wl, feat_in, Lw.qvgIn, Lw.goW_T,
+            Lw.ln_gamma.data(), Lw.ln_beta.data(),
+            H_all, feat_out_t);
+    }
+    auto t5 = std::chrono::steady_clock::now();
+    const double ns_tiled =
+        std::chrono::duration<double, std::nano>(t5 - t4).count() / N_ITERS;
+    std::printf("  tile-streaming (Phase 6)      : %7.1f ns/call    %.2fx vs gen, %.2fx vs fused\n",
+                ns_tiled, ns_generic / ns_tiled, ns_fused / ns_tiled);
 
     // ========================================================================
     // s0 L1 <12, 12> bench

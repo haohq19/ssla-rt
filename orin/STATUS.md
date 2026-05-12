@@ -1631,3 +1631,105 @@ by hardware (8 cores total) and by GPU drain (~0.6 Mev/s admit-equiv)
 becoming the system-level limit. fp16 (`asimdhp`) and int8 (`asimddp`)
 remain available but are out of scope due to numeric risk in the
 recurrent fp32 graph.
+
+## §11 — Tile-streaming fused kernels (2026-05-12, Phase 6)
+
+### §11.1 — Motivation
+
+`objdump` analysis of the Phase 3 fused interior kernels showed
+`s1_l1_interior` had 386 NEON stack reloads + 28 stack stores per call.
+The function needs ~36 NEON registers (6 x[6] inputs + 18 qvg[18]
+intermediates + 6 qh + 6 out persistent across the matvec_accum) but
+only 32 NEON registers exist on AArch64. Compiler spills the surplus
+to stack, killing per-call latency.
+
+### §11.2 — Design
+
+Tile-streaming partitions the 24 OUT channels into 6 tiles of 4
+channels each. For each tile:
+  1. compute q_tile, v_tile, g_tile (4 channels each) via 4-out ILP
+     matvec across IN=24 (or IN=12 for s1 L0)
+  2. lru_step on this tile → qh_tile (4 channels)
+  3. matvec_accum partial: `out[0..23] += goW_T[tile*4..+4, :] · qh_tile`
+
+Peak live register count: ~24 (6 persistent x + 6 persistent out + 4
+tile-local qvg + tile-local hc/qh + ACCUM temps) → fits in 32 NEON regs
+without spilling.
+
+The accumulator needs `goW` accessed by INPUT-row (not OUTPUT-row), so
+a transposed copy `goW_T[p][i*OUT+j] = goW[p][j*OUT+i]` is built once
+at `load_layer` (same memory footprint as goW, no runtime cost). The
+transpose lets ACCUM_TILE issue contiguous loads.
+
+### §11.3 — Harness bug discovered en route
+
+Initial bench harness reported `tile-streaming max|Δ| = 0.958` vs
+generic, which looked like an algorithm bug. After three targeted
+correctness tests (ACCUM_TILE one-hot isolation, goW_T transpose
+verification, strict-isolation harness with two separate H buffers),
+the algorithm was confirmed correct at fp32 noise (max|Δ| = 5.96e-7).
+
+Root cause: the bench was reusing `feat_out_g` (the generic-path
+reference output captured at (5, 5)) as the OUTPUT buffer in a 200k-iter
+warmup loop that rotated (x, y) across the interior. After the loop,
+`feat_out_g` held the result for the LAST (x, y), not (5, 5). The tile
+comparison was then comparing different pixel locations. Fix:
+snapshot `feat_out_g` to a separate buffer immediately after the
+(5, 5) call.
+
+### §11.4 — Production wire-up
+
+`stage_forward` in `src/ssla_kernels.cpp` now dispatches:
+- s1 L1 interior → `fused::s1_l1_interior_tiled` (uses `L1.goW_T`)
+- s1 L0 interior → `fused::s1_l0_interior_tiled` (uses `L0.goW_T`)
+
+Boundary path (non-interior events) still uses generic
+`layer_forward_ct`. The tiled inner kernel `patch_12_24_tiled` mirrors
+`patch_24_24_tiled` with IN=12 (3 NEON input vectors instead of 6) and
+a renamed `ACCUM_TILE_12` macro (identical body since HIDDEN=24 is
+the same).
+
+### §11.5 — Correctness (P1 gate)
+
+```
+bench_s2_s3_head_celled.py --n 200000
+drop drift = 0
+max|Δ| s3_feat = 4.4 over 12562 matched events
+```
+
+Unchanged from Phase 3 — within the ≤ 5.0 P1 budget.
+
+### §11.6 — Saturation sweep (synthetic 4.0 Mev/s, n=6 shards, 6 s)
+
+Pinning: shards on cores 1-6, C++ synth on core 7, Python on core 0.
+
+| cap | Phase 5 admit (non-tile) | Phase 6 L1 only | Phase 6 L0+L1 | p50 µs | p99 µs |
+|----:|------:|------:|------:|------:|------:|
+| 16  | 1.68  | 2.07  | **2.04**  | 17.7  | 61.7  |
+| 32  | 1.79  | 2.16  | **2.18**  | 30.0  | 107.6 |
+| 64  | 1.81  | 2.28  | **2.30**  | 51.4  | 188.7 |
+
+(admit is `preprocess` count / duration; ranks events including halo
+duplicates; aggregate across all 6 shards)
+
+L1 tile-streaming alone gave +21-26% admit (1.46× per-call speedup
+measured in `bench_fused`). Adding L0 tile-streaming was a wash
+(+0.15% over L1 only, within noise) because `patch_12_24` has only 3
+input vectors and was not register-pressure bound to begin with.
+Kept anyway for symmetry — both interior layers now use the same
+tile-streaming + goW_T pattern.
+
+### §11.7 — Headline (Phase 6 alone, tile-streaming)
+
+| metric | Phase 5 baseline | Phase 6 (L0+L1 tile) | gain |
+|---|---:|---:|---:|
+| s1_l1 per-call ns (isolated bench) | 4124 | **2817** | **1.46×** |
+| CPU admit @ cap=16 Mev/s | 1.68 | **2.04** | **1.21×** |
+| CPU admit @ cap=32 Mev/s | 1.79 | **2.18** | **1.22×** |
+| CPU admit @ cap=64 Mev/s | 1.81 | **2.30** | **1.27×** |
+| P1 max\|Δ\| | 4.4 | **4.4** | unchanged |
+
+The > 2 Mev/s admit target is now cleared at all ring-cap settings.
+MAX latency floor (~700µs-4ms) is unchanged from Phase 5 — it is set
+by OS daemons/IRQs on non-RT cores and requires SCHED_FIFO (i.e.
+root access) to address. Out of scope under the no-root constraint.

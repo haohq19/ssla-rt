@@ -354,6 +354,172 @@ static inline void s0_l1_interior(
 }
 
 // ============================================================================
+// One patch of <12, 24> tile-streaming variant. Mirrors patch_24_24_tiled but
+// with IN=12 (3 NEON input vectors instead of 6).
+// 6 tiles of 4 OUT channels each. qvgW is (72, 12), goW_T is (24, 24).
+// Hidden state width remains 24 → ACCUM_TILE identical to the L1 tiled path.
+// ============================================================================
+__attribute__((always_inline))
+static inline void patch_12_24_tiled(
+    const float32x4_t x0, const float32x4_t x1, const float32x4_t x2,
+    const float* __restrict__ qvgW,    // (72, 12) row-major
+    const float* __restrict__ goW_T,   // (24, 24) input-major
+    float*       __restrict__ h_ptr,   // (24,)
+    float32x4_t& out0, float32x4_t& out1, float32x4_t& out2,
+    float32x4_t& out3, float32x4_t& out4, float32x4_t& out5)
+{
+    // matvec for 4 outputs across IN=12 (3 input vectors).
+    #define MV4OUT12(rowbase, sink) do {                                       \
+        const float* r0 = (rowbase) + 0 * 12;                                  \
+        const float* r1 = (rowbase) + 1 * 12;                                  \
+        const float* r2 = (rowbase) + 2 * 12;                                  \
+        const float* r3 = (rowbase) + 3 * 12;                                  \
+        float32x4_t a0 = vmulq_f32(x0, vld1q_f32(r0 + 0));                     \
+        float32x4_t a1 = vmulq_f32(x0, vld1q_f32(r1 + 0));                     \
+        float32x4_t a2 = vmulq_f32(x0, vld1q_f32(r2 + 0));                     \
+        float32x4_t a3 = vmulq_f32(x0, vld1q_f32(r3 + 0));                     \
+        a0 = vfmaq_f32(a0, x1, vld1q_f32(r0 + 4));                             \
+        a1 = vfmaq_f32(a1, x1, vld1q_f32(r1 + 4));                             \
+        a2 = vfmaq_f32(a2, x1, vld1q_f32(r2 + 4));                             \
+        a3 = vfmaq_f32(a3, x1, vld1q_f32(r3 + 4));                             \
+        a0 = vfmaq_f32(a0, x2, vld1q_f32(r0 + 8));                             \
+        a1 = vfmaq_f32(a1, x2, vld1q_f32(r1 + 8));                             \
+        a2 = vfmaq_f32(a2, x2, vld1q_f32(r2 + 8));                             \
+        a3 = vfmaq_f32(a3, x2, vld1q_f32(r3 + 8));                             \
+        const float32x4_t s01 = vpaddq_f32(a0, a1);                            \
+        const float32x4_t s23 = vpaddq_f32(a2, a3);                            \
+        (sink) = vpaddq_f32(s01, s23);                                         \
+    } while (0)
+
+    #define ACCUM_TILE_12(tile) do {                                           \
+        const float* gT0 = goW_T + ((tile) * 4 + 0) * 24;                      \
+        const float* gT1 = goW_T + ((tile) * 4 + 1) * 24;                      \
+        const float* gT2 = goW_T + ((tile) * 4 + 2) * 24;                      \
+        const float* gT3 = goW_T + ((tile) * 4 + 3) * 24;                      \
+        const float32x4_t qhb0 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 0));      \
+        const float32x4_t qhb1 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 1));      \
+        const float32x4_t qhb2 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 2));      \
+        const float32x4_t qhb3 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 3));      \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT0 +  0), qhb0);                     \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT1 +  0), qhb1);                     \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT2 +  0), qhb2);                     \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT3 +  0), qhb3);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT0 +  4), qhb0);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT1 +  4), qhb1);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT2 +  4), qhb2);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT3 +  4), qhb3);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT0 +  8), qhb0);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT1 +  8), qhb1);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT2 +  8), qhb2);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT3 +  8), qhb3);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT0 + 12), qhb0);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT1 + 12), qhb1);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT2 + 12), qhb2);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT3 + 12), qhb3);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT0 + 16), qhb0);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT1 + 16), qhb1);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT2 + 16), qhb2);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT3 + 16), qhb3);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT0 + 20), qhb0);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT1 + 20), qhb1);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT2 + 20), qhb2);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT3 + 20), qhb3);                     \
+    } while (0)
+
+    #define DO_TILE_12(tile) do {                                              \
+        float32x4_t q_tile, v_tile, g_tile;                                    \
+        MV4OUT12(qvgW + ((tile) * 4) * 12,           q_tile);                  \
+        MV4OUT12(qvgW + (24 + (tile) * 4) * 12,      v_tile);                  \
+        MV4OUT12(qvgW + (48 + (tile) * 4) * 12,      g_tile);                  \
+        const float32x4_t gc = fused_sigmoid(g_tile);                          \
+        const float32x4_t hc = vfmaq_f32(v_tile, gc,                           \
+                                          vld1q_f32(h_ptr + (tile) * 4));      \
+        vst1q_f32(h_ptr + (tile) * 4, hc);                                     \
+        const float32x4_t qh_tile = vmulq_f32(q_tile, hc);                     \
+        ACCUM_TILE_12(tile);                                                   \
+    } while (0)
+
+    DO_TILE_12(0);
+    DO_TILE_12(1);
+    DO_TILE_12(2);
+    DO_TILE_12(3);
+    DO_TILE_12(4);
+    DO_TILE_12(5);
+
+    #undef DO_TILE_12
+    #undef ACCUM_TILE_12
+    #undef MV4OUT12
+}
+
+// ============================================================================
+// s1 L0 tile-streaming interior path. Same structure as s1_l0_interior but
+// calls patch_12_24_tiled (consuming goW_T) instead of patch_12_24.
+// ============================================================================
+__attribute__((always_inline))
+static inline void s1_l0_interior_tiled(
+    int ev_x, int ev_y, int Wl,
+    const float* __restrict__ feat_in,
+    const float* __restrict__ input_proj,
+    const std::array<std::vector<float>, 9>& qvgIn_arr,
+    const std::array<std::vector<float>, 9>& goW_T_arr,
+    const float* __restrict__ ln_gamma,
+    const float* __restrict__ ln_beta,
+    float*       __restrict__ H_all,
+    float*       __restrict__ feat_out)
+{
+    const float32x4_t x0 = vld1q_f32(feat_in + 0);
+    const float32x4_t x1 = vld1q_f32(feat_in + 4);
+    const float32x4_t x2 = vld1q_f32(feat_in + 8);
+
+    float32x4_t out0, out1, out2, out3, out4, out5;
+    #define RES(og, outx) do {                                                 \
+        const float* w0 = input_proj + ((og)*4 + 0) * 12;                      \
+        const float* w1 = input_proj + ((og)*4 + 1) * 12;                      \
+        const float* w2 = input_proj + ((og)*4 + 2) * 12;                      \
+        const float* w3 = input_proj + ((og)*4 + 3) * 12;                      \
+        float32x4_t a0 = vmulq_f32(x0, vld1q_f32(w0 + 0));                     \
+        float32x4_t a1 = vmulq_f32(x0, vld1q_f32(w1 + 0));                     \
+        float32x4_t a2 = vmulq_f32(x0, vld1q_f32(w2 + 0));                     \
+        float32x4_t a3 = vmulq_f32(x0, vld1q_f32(w3 + 0));                     \
+        a0 = vfmaq_f32(a0, x1, vld1q_f32(w0 + 4));                             \
+        a1 = vfmaq_f32(a1, x1, vld1q_f32(w1 + 4));                             \
+        a2 = vfmaq_f32(a2, x1, vld1q_f32(w2 + 4));                             \
+        a3 = vfmaq_f32(a3, x1, vld1q_f32(w3 + 4));                             \
+        a0 = vfmaq_f32(a0, x2, vld1q_f32(w0 + 8));                             \
+        a1 = vfmaq_f32(a1, x2, vld1q_f32(w1 + 8));                             \
+        a2 = vfmaq_f32(a2, x2, vld1q_f32(w2 + 8));                             \
+        a3 = vfmaq_f32(a3, x2, vld1q_f32(w3 + 8));                             \
+        const float32x4_t s01 = vpaddq_f32(a0, a1);                            \
+        const float32x4_t s23 = vpaddq_f32(a2, a3);                            \
+        (outx) = vpaddq_f32(s01, s23);                                         \
+    } while (0)
+    RES(0, out0); RES(1, out1); RES(2, out2);
+    RES(3, out3); RES(4, out4); RES(5, out5);
+    #undef RES
+
+    const int base = ev_y * Wl + ev_x;
+    constexpr int dx_arr[9] = {-1, 0, 1, -1, 0, 1, -1, 0, 1};
+    constexpr int dy_arr[9] = {-1, -1, -1, 0, 0, 0, 1, 1, 1};
+    constexpr int delta_arr[9] = {8, 7, 6, 5, 4, 3, 2, 1, 0};
+    for (int k = 0; k < 9; ++k) {
+        const int patch_idx = base + dy_arr[k] * Wl + dx_arr[k];
+        const int pos       = delta_arr[k];
+        patch_12_24_tiled(x0, x1, x2,
+                          qvgIn_arr[pos].data(), goW_T_arr[pos].data(),
+                          H_all + (std::ptrdiff_t)patch_idx * 24,
+                          out0, out1, out2, out3, out4, out5);
+    }
+
+    vst1q_f32(feat_out +  0, out0);
+    vst1q_f32(feat_out +  4, out1);
+    vst1q_f32(feat_out +  8, out2);
+    vst1q_f32(feat_out + 12, out3);
+    vst1q_f32(feat_out + 16, out4);
+    vst1q_f32(feat_out + 20, out5);
+    openeva::prim::layernorm_ct<24>(feat_out, ln_gamma, ln_beta);
+}
+
+// ============================================================================
 // One patch of <12, 24>: matvec_qvg<12,72> + lru_step<24> + matvec_accum<24,24>
 // Used by s1 L0.
 // ============================================================================
@@ -529,8 +695,126 @@ static inline void s1_l0_interior(
 }
 
 // ============================================================================
-// One patch of <24, 24>: matvec_qvg<24,72> + lru_step<24> + matvec_accum<24,24>
-// Used by s1 L1.
+// One patch of <24, 24> tile-streaming variant.
+// 6 tiles of 4 OUT channels each. Per tile:
+//   1) compute q_tile, v_tile, g_tile (4 channels each) via 4-out ILP
+//   2) lru_step on this tile → qh_tile
+//   3) matvec_accum partial: out[0..23] += goW_T[tile*4..+4, :] × qh_tile
+// Each tile holds only ~12 live NEON regs (qvg of one tile + qh + temps);
+// the 6 persistent x[6] + 6 out[6] across tiles totals ~24 regs.
+// vs. all-in-once version's ~36 regs → no spill.
+//
+// `goW_T` (input-major transpose of goW) lets the matvec_accum tile use
+// contiguous loads. Pre-computed at load_layer().
+// ============================================================================
+__attribute__((always_inline))
+static inline void patch_24_24_tiled(
+    const float32x4_t x0, const float32x4_t x1, const float32x4_t x2,
+    const float32x4_t x3, const float32x4_t x4, const float32x4_t x5,
+    const float* __restrict__ qvgW,    // (72, 24) row-major
+    const float* __restrict__ goW_T,   // (24, 24) input-major
+    float*       __restrict__ h_ptr,   // (24,)
+    float32x4_t& out0, float32x4_t& out1, float32x4_t& out2,
+    float32x4_t& out3, float32x4_t& out4, float32x4_t& out5)
+{
+    // matvec for 4 outputs across IN=24 (6 input vectors).
+    #define MV4OUT24(rowbase, sink) do {                                       \
+        const float* r0 = (rowbase) + 0 * 24;                                  \
+        const float* r1 = (rowbase) + 1 * 24;                                  \
+        const float* r2 = (rowbase) + 2 * 24;                                  \
+        const float* r3 = (rowbase) + 3 * 24;                                  \
+        float32x4_t a0 = vmulq_f32(x0, vld1q_f32(r0 +  0));                    \
+        float32x4_t a1 = vmulq_f32(x0, vld1q_f32(r1 +  0));                    \
+        float32x4_t a2 = vmulq_f32(x0, vld1q_f32(r2 +  0));                    \
+        float32x4_t a3 = vmulq_f32(x0, vld1q_f32(r3 +  0));                    \
+        a0 = vfmaq_f32(a0, x1, vld1q_f32(r0 +  4));                            \
+        a1 = vfmaq_f32(a1, x1, vld1q_f32(r1 +  4));                            \
+        a2 = vfmaq_f32(a2, x1, vld1q_f32(r2 +  4));                            \
+        a3 = vfmaq_f32(a3, x1, vld1q_f32(r3 +  4));                            \
+        a0 = vfmaq_f32(a0, x2, vld1q_f32(r0 +  8));                            \
+        a1 = vfmaq_f32(a1, x2, vld1q_f32(r1 +  8));                            \
+        a2 = vfmaq_f32(a2, x2, vld1q_f32(r2 +  8));                            \
+        a3 = vfmaq_f32(a3, x2, vld1q_f32(r3 +  8));                            \
+        a0 = vfmaq_f32(a0, x3, vld1q_f32(r0 + 12));                            \
+        a1 = vfmaq_f32(a1, x3, vld1q_f32(r1 + 12));                            \
+        a2 = vfmaq_f32(a2, x3, vld1q_f32(r2 + 12));                            \
+        a3 = vfmaq_f32(a3, x3, vld1q_f32(r3 + 12));                            \
+        a0 = vfmaq_f32(a0, x4, vld1q_f32(r0 + 16));                            \
+        a1 = vfmaq_f32(a1, x4, vld1q_f32(r1 + 16));                            \
+        a2 = vfmaq_f32(a2, x4, vld1q_f32(r2 + 16));                            \
+        a3 = vfmaq_f32(a3, x4, vld1q_f32(r3 + 16));                            \
+        a0 = vfmaq_f32(a0, x5, vld1q_f32(r0 + 20));                            \
+        a1 = vfmaq_f32(a1, x5, vld1q_f32(r1 + 20));                            \
+        a2 = vfmaq_f32(a2, x5, vld1q_f32(r2 + 20));                            \
+        a3 = vfmaq_f32(a3, x5, vld1q_f32(r3 + 20));                            \
+        const float32x4_t s01 = vpaddq_f32(a0, a1);                            \
+        const float32x4_t s23 = vpaddq_f32(a2, a3);                            \
+        (sink) = vpaddq_f32(s01, s23);                                         \
+    } while (0)
+
+    #define ACCUM_TILE(tile) do {                                              \
+        const float* gT0 = goW_T + ((tile) * 4 + 0) * 24;                      \
+        const float* gT1 = goW_T + ((tile) * 4 + 1) * 24;                      \
+        const float* gT2 = goW_T + ((tile) * 4 + 2) * 24;                      \
+        const float* gT3 = goW_T + ((tile) * 4 + 3) * 24;                      \
+        const float32x4_t qhb0 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 0));      \
+        const float32x4_t qhb1 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 1));      \
+        const float32x4_t qhb2 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 2));      \
+        const float32x4_t qhb3 = vdupq_n_f32(vgetq_lane_f32(qh_tile, 3));      \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT0 +  0), qhb0);                     \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT1 +  0), qhb1);                     \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT2 +  0), qhb2);                     \
+        out0 = vfmaq_f32(out0, vld1q_f32(gT3 +  0), qhb3);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT0 +  4), qhb0);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT1 +  4), qhb1);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT2 +  4), qhb2);                     \
+        out1 = vfmaq_f32(out1, vld1q_f32(gT3 +  4), qhb3);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT0 +  8), qhb0);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT1 +  8), qhb1);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT2 +  8), qhb2);                     \
+        out2 = vfmaq_f32(out2, vld1q_f32(gT3 +  8), qhb3);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT0 + 12), qhb0);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT1 + 12), qhb1);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT2 + 12), qhb2);                     \
+        out3 = vfmaq_f32(out3, vld1q_f32(gT3 + 12), qhb3);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT0 + 16), qhb0);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT1 + 16), qhb1);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT2 + 16), qhb2);                     \
+        out4 = vfmaq_f32(out4, vld1q_f32(gT3 + 16), qhb3);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT0 + 20), qhb0);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT1 + 20), qhb1);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT2 + 20), qhb2);                     \
+        out5 = vfmaq_f32(out5, vld1q_f32(gT3 + 20), qhb3);                     \
+    } while (0)
+
+    // NEON tile-streaming. 6 tiles, each 4 channels.
+    #define DO_TILE(tile) do {                                                 \
+        float32x4_t q_tile, v_tile, g_tile;                                    \
+        MV4OUT24(qvgW + ((tile) * 4) * 24,           q_tile);                  \
+        MV4OUT24(qvgW + (24 + (tile) * 4) * 24,      v_tile);                  \
+        MV4OUT24(qvgW + (48 + (tile) * 4) * 24,      g_tile);                  \
+        const float32x4_t gc = fused_sigmoid(g_tile);                          \
+        const float32x4_t hc = vfmaq_f32(v_tile, gc,                           \
+                                          vld1q_f32(h_ptr + (tile) * 4));      \
+        vst1q_f32(h_ptr + (tile) * 4, hc);                                     \
+        const float32x4_t qh_tile = vmulq_f32(q_tile, hc);                     \
+        ACCUM_TILE(tile);                                                      \
+    } while (0)
+
+    DO_TILE(0);
+    DO_TILE(1);
+    DO_TILE(2);
+    DO_TILE(3);
+    DO_TILE(4);
+    DO_TILE(5);
+
+    #undef DO_TILE
+    #undef ACCUM_TILE
+    #undef MV4OUT24
+}
+
+// ============================================================================
+// Original (not-tiled) patch_24_24 kept below for back-compat / boundary path.
 // ============================================================================
 __attribute__((always_inline))
 static inline void patch_24_24(
@@ -692,6 +976,63 @@ static inline void s1_l1_interior(
                     qvgIn_arr[pos].data(), goW_arr[pos].data(),
                     H_all + (std::ptrdiff_t)patch_idx * 24,
                     out0, out1, out2, out3, out4, out5);
+    }
+
+    out0 = vaddq_f32(out0, x0);
+    out1 = vaddq_f32(out1, x1);
+    out2 = vaddq_f32(out2, x2);
+    out3 = vaddq_f32(out3, x3);
+    out4 = vaddq_f32(out4, x4);
+    out5 = vaddq_f32(out5, x5);
+
+    vst1q_f32(feat_out +  0, out0);
+    vst1q_f32(feat_out +  4, out1);
+    vst1q_f32(feat_out +  8, out2);
+    vst1q_f32(feat_out + 12, out3);
+    vst1q_f32(feat_out + 16, out4);
+    vst1q_f32(feat_out + 20, out5);
+    openeva::prim::layernorm_ct<24>(feat_out, ln_gamma, ln_beta);
+}
+
+// ============================================================================
+// Tile-streaming s1 L1. Takes goW_T (pre-transposed) instead of goW.
+// ============================================================================
+static inline void s1_l1_interior_tiled(
+    int ev_x, int ev_y, int Wl,
+    const float* __restrict__ feat_in,
+    const std::array<std::vector<float>, 9>& qvgIn_arr,
+    const std::array<std::vector<float>, 9>& goW_T_arr,
+    const float* __restrict__ ln_gamma,
+    const float* __restrict__ ln_beta,
+    float*       __restrict__ H_all,
+    float*       __restrict__ feat_out)
+{
+    const float32x4_t x0 = vld1q_f32(feat_in +  0);
+    const float32x4_t x1 = vld1q_f32(feat_in +  4);
+    const float32x4_t x2 = vld1q_f32(feat_in +  8);
+    const float32x4_t x3 = vld1q_f32(feat_in + 12);
+    const float32x4_t x4 = vld1q_f32(feat_in + 16);
+    const float32x4_t x5 = vld1q_f32(feat_in + 20);
+
+    float32x4_t out0 = vdupq_n_f32(0.0f);
+    float32x4_t out1 = vdupq_n_f32(0.0f);
+    float32x4_t out2 = vdupq_n_f32(0.0f);
+    float32x4_t out3 = vdupq_n_f32(0.0f);
+    float32x4_t out4 = vdupq_n_f32(0.0f);
+    float32x4_t out5 = vdupq_n_f32(0.0f);
+
+    const int base = ev_y * Wl + ev_x;
+    constexpr int dx_arr[9] = {-1, 0, 1, -1, 0, 1, -1, 0, 1};
+    constexpr int dy_arr[9] = {-1, -1, -1, 0, 0, 0, 1, 1, 1};
+    constexpr int delta_arr[9] = {8, 7, 6, 5, 4, 3, 2, 1, 0};
+
+    for (int k = 0; k < 9; ++k) {
+        const int patch_idx = base + dy_arr[k] * Wl + dx_arr[k];
+        const int pos       = delta_arr[k];
+        patch_24_24_tiled(x0, x1, x2, x3, x4, x5,
+                          qvgIn_arr[pos].data(), goW_T_arr[pos].data(),
+                          H_all + (std::ptrdiff_t)patch_idx * 24,
+                          out0, out1, out2, out3, out4, out5);
     }
 
     out0 = vaddq_f32(out0, x0);
