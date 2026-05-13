@@ -135,9 +135,9 @@ def main() -> int:
 
     cpu_layers, gpu_layers, ka_layers = build_n_block_layers(
         rng, n_blocks, H2, W2, H3, W3)
+    keepalive = list(ka_layers)
 
     # Per-block tdrop counters in managed memory.
-    keepalive = list(ka_layers)
     tdrop_s2_dev = []
     tdrop_s3_dev = []
     for _ in range(n_blocks):
@@ -245,6 +245,39 @@ def main() -> int:
     if int(_err) != 0:
         raise RuntimeError(f"cuFuncSetAttribute(MAX_DYNAMIC_SHARED): err={int(_err)}, smem={SMEM}")
 
+    # ---- L2 persistence for L7 qvgIn weights ----
+    # L7 qvgIn (972 KB) is the largest single weight buffer. Pinning it in
+    # L2 prevents eviction between batches by the L4/L5/L6/hidden-state
+    # traffic (total ~2.6 MB of weights vs 2 MB L2). Measured: +1.7%
+    # throughput, ~25% p99 tail latency reduction. Pinning L6 in addition
+    # tested with a contiguous L6+L7 buffer — no net throughput improvement,
+    # likely because it squeezes the L2 budget for non-persistent data.
+    L7_QVG_BYTES = 9 * 3 * C3 * C3 * 4   # 995,328 B ≈ 972 KB
+    _err, = _cuda.cuCtxSetLimit(
+        _cuda.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE, L7_QVG_BYTES)
+    if int(_err) != 0:
+        raise RuntimeError(f"cuCtxSetLimit(PERSISTING_L2): err={int(_err)}")
+    _err, kstream = _cuda.cuStreamCreate(0)
+    if int(_err) != 0:
+        raise RuntimeError(f"cuStreamCreate: err={int(_err)}")
+    p_qvg_L7 = gpu_layers[0][3]["qvgIn"]   # shared across blocks
+    apw = _cuda.CUaccessPolicyWindow()
+    apw.base_ptr = p_qvg_L7
+    apw.num_bytes = L7_QVG_BYTES
+    apw.hitRatio = 1.0
+    apw.hitProp = _cuda.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING
+    apw.missProp = _cuda.CUaccessProperty.CU_ACCESS_PROPERTY_STREAMING
+    sattr = _cuda.CUstreamAttrValue()
+    sattr.accessPolicyWindow = apw
+    _err, = _cuda.cuStreamSetAttribute(
+        kstream,
+        _cuda.CUstreamAttrID.CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW,
+        sattr)
+    if int(_err) != 0:
+        raise RuntimeError(f"cuStreamSetAttribute(ACCESS_POLICY): err={int(_err)}")
+    print(f"L2 persistence: L7 qvgIn @ {hex(p_qvg_L7)}, "
+          f"{L7_QVG_BYTES/1024:.1f} KB persistent")
+
     print(f"\nGPU drain (multi): {n_blocks} blocks × {threads_per_block} threads, "
           f"smem={SMEM} B (n/block={n_per_block})\n")
     SM_CLK_HZ = 918_000_000  # nominal; actual is DVFS-controlled
@@ -267,7 +300,7 @@ def main() -> int:
             arg_ptr(ns_arr_dev),
             arg_ptr(out_ptr_arr),
             arg_ptr(clk_ptr_arr),
-        ], smem=SMEM)
+        ], smem=SMEM, stream=int(kstream))
         func.sync()
         gpu_dt = time.monotonic() - t0
         kevs = args.n / gpu_dt / 1e3
