@@ -216,26 +216,55 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
         seg_record(ctx, SEG_PREPROCESS, t_seg1 - t_seg0);
 
         int x = ex0, y = ey0;
-        pipe.stage_forward(0, x, y, feat_in, feat0.data());
+
+        // ---- A1 OPTIMISATION ----
+        // Decide whether stage 0's OUTPUT (feat0) will be consumed before
+        // running stage_forward(0): only owners that pass tdrop_0 will
+        // proceed to stage 1 and need feat0. Everyone else (halo events,
+        // and owners that fail tdrop_0) can run stage 0 in state-only
+        // mode — s0_L0 full (its tmp feeds s0_L1 qvg input), s0_L1
+        // skips goW + Res + LN.
+        bool pass0 = false;
+        const int x1 = x / 2, y1 = y / 2;   // stage 1 grid coords
+        if (m.is_owner) {
+            pass0 = pipe.tdrop_check_at(0, x1, y1);
+        }
+        const std::uint64_t t_seg2_tdrop = TICK();
+        // Note: SEG_TDROP0 originally measured tdrop time AFTER s0; we
+        // measure it BEFORE s0 in the A1 path. Same physical work.
+        seg_record(ctx, SEG_TDROP0, t_seg2_tdrop - t_seg1);
+
+        if (m.is_owner && pass0) {
+            pipe.stage_forward(0, x, y, feat_in, feat0.data());
+        } else {
+            pipe.stage_forward_state_only(0, x, y, feat_in);
+        }
         const std::uint64_t t_seg2 = TICK();
-        seg_record(ctx, SEG_S0, t_seg2 - t_seg1);
+        seg_record(ctx, SEG_S0, t_seg2 - t_seg2_tdrop);
 
         if (m.is_owner) {
-            const bool pass0 = pipe.tdrop_and_pool(0, x, y);
-            const std::uint64_t t_seg3 = TICK();
-            seg_record(ctx, SEG_TDROP0, t_seg3 - t_seg2);
-
+            // x/y were not modified by tdrop_check_at; pool them now
+            // (the original tdrop_and_pool also pooled in-place).
+            x = x1; y = y1;
             bool pass1 = false;
-            std::uint64_t t_after_s1_block = t_seg3;
+            std::uint64_t t_after_s1_block = t_seg2;
             if (pass0) {
-                pipe.stage_forward(1, x, y, feat0.data(), feat1.data());
+                // For stage 1: check tdrop_1 first to know if feat1
+                // will be consumed (i.e. pushed to GPU).
+                const int x2 = x / 2, y2 = y / 2;
+                pass1 = pipe.tdrop_check_at(1, x2, y2);
+                const std::uint64_t t_seg3 = TICK();
+                seg_record(ctx, SEG_TDROP1, t_seg3 - t_seg2);
+
+                if (pass1) {
+                    pipe.stage_forward(1, x, y, feat0.data(), feat1.data());
+                } else {
+                    pipe.stage_forward_state_only(1, x, y, feat0.data());
+                }
                 const std::uint64_t t_seg4 = TICK();
                 seg_record(ctx, SEG_S1, t_seg4 - t_seg3);
-
-                pass1 = pipe.tdrop_and_pool(1, x, y);
-                const std::uint64_t t_seg5 = TICK();
-                seg_record(ctx, SEG_TDROP1, t_seg5 - t_seg4);
-                t_after_s1_block = t_seg5;
+                t_after_s1_block = t_seg4;
+                x = x2; y = y2;
             }
 
             // ---- HYBRID HOOK: push to GPU per-block ring(s) ----

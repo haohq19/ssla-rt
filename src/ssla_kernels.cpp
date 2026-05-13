@@ -809,6 +809,77 @@ void SslaSPipeline::stage_forward(int stage, int ev_x, int ev_y,
     }
 }
 
+// State-only stage forward: first layer FULL (its output feeds the second
+// layer), second layer STATE_ONLY (qvg+lru, skip goW+Res+LN — feat_out
+// not produced). Used for events whose stage output won't be consumed
+// (halo events, or events that fail the upcoming tdrop).
+void SslaSPipeline::stage_forward_state_only(int stage, int ev_x, int ev_y,
+                                              const float* feat_in) {
+    float* tmp = stage_out_[stage].data();
+    const int Wl = Ws_[stage];
+    const int Hl = Hs_[stage];
+    const bool interior = (ev_x > 0) && (ev_x + 1 < Wl)
+                       && (ev_y > 0) && (ev_y + 1 < Hl);
+    switch (stage) {
+        case 0:
+            if (interior) {
+                // s0 L0 full (output feeds s0 L1 qvg input).
+                const auto& L0 = layers_[0];
+                fused::s0_l0_interior(
+                    ev_x, ev_y, Wl, feat_in,
+                    L0.input_proj.empty() ? nullptr : L0.input_proj.data(),
+                    L0.qvgIn[0].data(), L0.goW[0].data(),
+                    L0.ln_gamma.data(), L0.ln_beta.data(),
+                    hidden_[0].data(), tmp);
+                // s0 L1 STATE_ONLY: update hidden state, skip output.
+                const auto& L1 = layers_[1];
+                fused::s0_l1_interior_state_only(
+                    ev_x, ev_y, Wl, tmp,
+                    L1.qvgIn,
+                    hidden_[1].data());
+            } else {
+                // Boundary: fall back to full forward (boundary events
+                // are rare; the saving here is marginal). Allocate a
+                // scratch for feat_out and discard.
+                float scratch[kC0];
+                layer_forward_ct<kInDim, kC0>(0, ev_x, ev_y, feat_in, tmp);
+                layer_forward_ct<kC0, kC0>(1, ev_x, ev_y, tmp, scratch);
+            }
+            break;
+        case 1:
+            if (interior) {
+                // s1 L0 full.
+                const auto& L0 = layers_[2];
+                fused::s1_l0_interior_tiled(
+                    ev_x, ev_y, Wl, feat_in,
+                    L0.input_proj.empty() ? nullptr : L0.input_proj.data(),
+                    L0.qvgIn, L0.goW_T,
+                    L0.ln_gamma.data(), L0.ln_beta.data(),
+                    hidden_[2].data(), tmp);
+                // s1 L1 STATE_ONLY.
+                const auto& L1 = layers_[3];
+                fused::s1_l1_interior_tiled_state_only(
+                    ev_x, ev_y, Wl, tmp,
+                    L1.qvgIn,
+                    hidden_[3].data());
+            } else {
+                float scratch[kC1];
+                layer_forward_ct<kC0, kC1>(2, ev_x, ev_y, feat_in, tmp);
+                layer_forward_ct<kC1, kC1>(3, ev_x, ev_y, tmp, scratch);
+            }
+            break;
+        default:
+            // For stages 2-3 fall back to full forward (these aren't on
+            // the CPU-side tdrop path anyway).
+            {
+                float scratch[kC3];   // largest possible out dim
+                stage_forward(stage, ev_x, ev_y, feat_in, scratch);
+            }
+            break;
+    }
+}
+
+
 void SslaSPipeline::layer_forward(int layer_idx, int ev_x, int ev_y,
                                    const float* feat_in, float* feat_out) {
     switch (layer_idx) {
@@ -833,8 +904,15 @@ bool SslaSPipeline::tdrop_and_pool(int stage, int& ev_x, int& ev_y) {
     if (stage < 0 || stage > 2) return true;  // no boundary after stage 3
     ev_x /= 2;
     ev_y /= 2;
+    return tdrop_check_at(stage, ev_x, ev_y);
+}
+
+// Split form: just increment counter at given pre-pooled coords. Caller
+// owns the pooling. Same semantics as the increment in tdrop_and_pool.
+bool SslaSPipeline::tdrop_check_at(int stage, int pooled_ev_x, int pooled_ev_y) {
+    if (stage < 0 || stage > 2) return true;
     const int Wp  = Ws_[stage + 1];
-    const int idx = ev_y * Wp + ev_x;
+    const int idx = pooled_ev_y * Wp + pooled_ev_x;
     std::uint8_t& c = tdrop_counter_[stage][idx];
     const std::uint8_t pre = c;
     c = static_cast<std::uint8_t>(c + 1u);

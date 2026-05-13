@@ -94,6 +94,16 @@ public:
     void stage_forward(int stage, int ev_x, int ev_y,
                        const float* feat_in, float* feat_out);
 
+    // Hidden-state-only variant: same as stage_forward but the LAST layer
+    // of the stage skips the goW + residual + LN steps (its feat_out is
+    // not written). Used when the caller knows the event will be
+    // tdrop-dropped or is a halo event whose stage output is unused.
+    // The FIRST layer of the stage still runs in full because its output
+    // feeds the second layer's qvg input. Only stages 0 and 1 are
+    // supported (other stages currently fall back to stage_forward).
+    void stage_forward_state_only(int stage, int ev_x, int ev_y,
+                                  const float* feat_in);
+
     // Bench-only public accessor for per-layer weight buffers. Used by
     // tests/bench_fused.cpp to compare the generic layer_forward against a
     // hand-fused interior kernel. Not part of the runtime contract.
@@ -233,6 +243,13 @@ public:
     //
     // stage in [0, 2]: there is no pool/dropout after stage 3.
     bool tdrop_and_pool(int stage, int& ev_x, int& ev_y);
+
+    // Split form: increment the post-stage tdrop counter at the GIVEN
+    // pooled coords and return pass/drop. Caller must compute the pooled
+    // coords (ev_x/2, ev_y/2) themselves. Used by the A1 optimisation path
+    // where tdrop must be queried BEFORE running stage_forward, so the
+    // skip flag can be passed to stage_forward_state_only.
+    bool tdrop_check_at(int stage, int pooled_ev_x, int pooled_ev_y);
 
     // Head decode for one cell at the given stage's resolution. Writes one
     // row of last_predictions_. Stage must be in head_stage_idx_ (i.e. an

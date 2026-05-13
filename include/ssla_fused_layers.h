@@ -309,6 +309,84 @@ static inline void patch_12_12(
 }
 
 // s0 L1 = <12, 12>. No input_proj (IN==OUT) → residual is feat_in.
+// patch_12_12 state-only: same MQV + LRU as patch_12_12 above, but
+// without the MAC step that produces the goW contribution. Hidden state
+// at h_ptr is updated identically. Used when the caller knows the event's
+// feat_out won't be consumed (halo events or events about to be
+// tdrop-dropped) — skips ~30-40% of the per-patch work.
+__attribute__((always_inline))
+static inline void patch_12_12_state_only(
+    const float32x4_t x0, const float32x4_t x1, const float32x4_t x2,
+    const float* __restrict__ qvgW,
+    float*       __restrict__ h_ptr)
+{
+    float32x4_t qvg0, qvg1, qvg2, qvg3, qvg4, qvg5, qvg6, qvg7, qvg8;
+    #define MQV(og, sink) do {                                                 \
+        const float* w0 = qvgW + ((og)*4 + 0) * 12;                            \
+        const float* w1 = qvgW + ((og)*4 + 1) * 12;                            \
+        const float* w2 = qvgW + ((og)*4 + 2) * 12;                            \
+        const float* w3 = qvgW + ((og)*4 + 3) * 12;                            \
+        float32x4_t a0 = vmulq_f32(x0, vld1q_f32(w0 + 0));                     \
+        float32x4_t a1 = vmulq_f32(x0, vld1q_f32(w1 + 0));                     \
+        float32x4_t a2 = vmulq_f32(x0, vld1q_f32(w2 + 0));                     \
+        float32x4_t a3 = vmulq_f32(x0, vld1q_f32(w3 + 0));                     \
+        a0 = vfmaq_f32(a0, x1, vld1q_f32(w0 + 4));                             \
+        a1 = vfmaq_f32(a1, x1, vld1q_f32(w1 + 4));                             \
+        a2 = vfmaq_f32(a2, x1, vld1q_f32(w2 + 4));                             \
+        a3 = vfmaq_f32(a3, x1, vld1q_f32(w3 + 4));                             \
+        a0 = vfmaq_f32(a0, x2, vld1q_f32(w0 + 8));                             \
+        a1 = vfmaq_f32(a1, x2, vld1q_f32(w1 + 8));                             \
+        a2 = vfmaq_f32(a2, x2, vld1q_f32(w2 + 8));                             \
+        a3 = vfmaq_f32(a3, x2, vld1q_f32(w3 + 8));                             \
+        const float32x4_t s01 = vpaddq_f32(a0, a1);                            \
+        const float32x4_t s23 = vpaddq_f32(a2, a3);                            \
+        (sink) = vpaddq_f32(s01, s23);                                         \
+    } while (0)
+    MQV(0, qvg0); MQV(1, qvg1); MQV(2, qvg2);
+    MQV(3, qvg3); MQV(4, qvg4); MQV(5, qvg5);
+    MQV(6, qvg6); MQV(7, qvg7); MQV(8, qvg8);
+    #undef MQV
+
+    #define LRU(b, vv, gv) do {                                                \
+        const float32x4_t gc = fused_sigmoid(gv);                              \
+        const float32x4_t hc = vfmaq_f32(vv, gc, vld1q_f32(h_ptr + (b) * 4));  \
+        vst1q_f32(h_ptr + (b) * 4, hc);                                        \
+    } while (0)
+    LRU(0, qvg3, qvg6);
+    LRU(1, qvg4, qvg7);
+    LRU(2, qvg5, qvg8);
+    #undef LRU
+    // No MAC: caller doesn't need the goW contribution.
+    (void)qvg0; (void)qvg1; (void)qvg2;
+}
+
+
+// s0 L1 state-only: same per-patch sweep as s0_l1_interior but uses the
+// state-only patch primitive — updates the 9 cells' hidden state, skips
+// the goW + residual + LN that would produce feat_out.
+static inline void s0_l1_interior_state_only(
+    int ev_x, int ev_y, int Wl,
+    const float* __restrict__ feat_in,
+    const std::array<std::vector<float>, 9>& qvgIn_arr,
+    float*       __restrict__ H_all)
+{
+    const float32x4_t x0 = vld1q_f32(feat_in + 0);
+    const float32x4_t x1 = vld1q_f32(feat_in + 4);
+    const float32x4_t x2 = vld1q_f32(feat_in + 8);
+    const int base = ev_y * Wl + ev_x;
+    constexpr int dx_arr[9] = {-1, 0, 1, -1, 0, 1, -1, 0, 1};
+    constexpr int dy_arr[9] = {-1, -1, -1, 0, 0, 0, 1, 1, 1};
+    constexpr int delta_arr[9] = {8, 7, 6, 5, 4, 3, 2, 1, 0};
+    for (int k = 0; k < 9; ++k) {
+        const int patch_idx = base + dy_arr[k] * Wl + dx_arr[k];
+        const int pos       = delta_arr[k];
+        patch_12_12_state_only(x0, x1, x2,
+                               qvgIn_arr[pos].data(),
+                               H_all + (std::ptrdiff_t)patch_idx * 12);
+    }
+}
+
+
 static inline void s0_l1_interior(
     int ev_x, int ev_y, int Wl,
     const float* __restrict__ feat_in,
@@ -812,6 +890,107 @@ static inline void patch_24_24_tiled(
     #undef ACCUM_TILE
     #undef MV4OUT24
 }
+
+// patch_24_24 state-only (tile-streaming variant): same MV4OUT24 + LRU
+// as patch_24_24_tiled but without the ACCUM_TILE goW contribution.
+// Hidden state at h_ptr is updated identically. Used for events whose
+// feat_out won't be consumed (skips ~25-30% of per-patch work).
+__attribute__((always_inline))
+static inline void patch_24_24_tiled_state_only(
+    const float32x4_t x0, const float32x4_t x1, const float32x4_t x2,
+    const float32x4_t x3, const float32x4_t x4, const float32x4_t x5,
+    const float* __restrict__ qvgW,    // (72, 24) row-major
+    float*       __restrict__ h_ptr)
+{
+    #define MV4OUT24S(rowbase, sink) do {                                      \
+        const float* r0 = (rowbase) + 0 * 24;                                  \
+        const float* r1 = (rowbase) + 1 * 24;                                  \
+        const float* r2 = (rowbase) + 2 * 24;                                  \
+        const float* r3 = (rowbase) + 3 * 24;                                  \
+        float32x4_t a0 = vmulq_f32(x0, vld1q_f32(r0 +  0));                    \
+        float32x4_t a1 = vmulq_f32(x0, vld1q_f32(r1 +  0));                    \
+        float32x4_t a2 = vmulq_f32(x0, vld1q_f32(r2 +  0));                    \
+        float32x4_t a3 = vmulq_f32(x0, vld1q_f32(r3 +  0));                    \
+        a0 = vfmaq_f32(a0, x1, vld1q_f32(r0 +  4));                            \
+        a1 = vfmaq_f32(a1, x1, vld1q_f32(r1 +  4));                            \
+        a2 = vfmaq_f32(a2, x1, vld1q_f32(r2 +  4));                            \
+        a3 = vfmaq_f32(a3, x1, vld1q_f32(r3 +  4));                            \
+        a0 = vfmaq_f32(a0, x2, vld1q_f32(r0 +  8));                            \
+        a1 = vfmaq_f32(a1, x2, vld1q_f32(r1 +  8));                            \
+        a2 = vfmaq_f32(a2, x2, vld1q_f32(r2 +  8));                            \
+        a3 = vfmaq_f32(a3, x2, vld1q_f32(r3 +  8));                            \
+        a0 = vfmaq_f32(a0, x3, vld1q_f32(r0 + 12));                            \
+        a1 = vfmaq_f32(a1, x3, vld1q_f32(r1 + 12));                            \
+        a2 = vfmaq_f32(a2, x3, vld1q_f32(r2 + 12));                            \
+        a3 = vfmaq_f32(a3, x3, vld1q_f32(r3 + 12));                            \
+        a0 = vfmaq_f32(a0, x4, vld1q_f32(r0 + 16));                            \
+        a1 = vfmaq_f32(a1, x4, vld1q_f32(r1 + 16));                            \
+        a2 = vfmaq_f32(a2, x4, vld1q_f32(r2 + 16));                            \
+        a3 = vfmaq_f32(a3, x4, vld1q_f32(r3 + 16));                            \
+        a0 = vfmaq_f32(a0, x5, vld1q_f32(r0 + 20));                            \
+        a1 = vfmaq_f32(a1, x5, vld1q_f32(r1 + 20));                            \
+        a2 = vfmaq_f32(a2, x5, vld1q_f32(r2 + 20));                            \
+        a3 = vfmaq_f32(a3, x5, vld1q_f32(r3 + 20));                            \
+        const float32x4_t s01 = vpaddq_f32(a0, a1);                            \
+        const float32x4_t s23 = vpaddq_f32(a2, a3);                            \
+        (sink) = vpaddq_f32(s01, s23);                                         \
+    } while (0)
+
+    // 6 tiles of 4 OUT channels each. Per tile: compute v/g (4 chans),
+    // run lru on this tile (writes h_ptr slice), discard qh.
+    // We compute v and g but skip the q matvec since it's not needed
+    // without the ACCUM_TILE step.
+    #define DO_TILE_S(tile) do {                                               \
+        float32x4_t v_tile, g_tile;                                            \
+        MV4OUT24S(qvgW + (24 + (tile) * 4) * 24, v_tile);                      \
+        MV4OUT24S(qvgW + (48 + (tile) * 4) * 24, g_tile);                      \
+        const float32x4_t gc = fused_sigmoid(g_tile);                          \
+        const float32x4_t hc = vfmaq_f32(v_tile, gc,                           \
+                                          vld1q_f32(h_ptr + (tile) * 4));      \
+        vst1q_f32(h_ptr + (tile) * 4, hc);                                     \
+    } while (0)
+
+    DO_TILE_S(0);
+    DO_TILE_S(1);
+    DO_TILE_S(2);
+    DO_TILE_S(3);
+    DO_TILE_S(4);
+    DO_TILE_S(5);
+
+    #undef DO_TILE_S
+    #undef MV4OUT24S
+}
+
+
+// s1 L1 state-only tile-streaming: 9 patches' hidden state update without
+// the goW contribution accumulation, residual add, or LayerNorm.
+static inline void s1_l1_interior_tiled_state_only(
+    int ev_x, int ev_y, int Wl,
+    const float* __restrict__ feat_in,
+    const std::array<std::vector<float>, 9>& qvgIn_arr,
+    float*       __restrict__ H_all)
+{
+    const float32x4_t x0 = vld1q_f32(feat_in +  0);
+    const float32x4_t x1 = vld1q_f32(feat_in +  4);
+    const float32x4_t x2 = vld1q_f32(feat_in +  8);
+    const float32x4_t x3 = vld1q_f32(feat_in + 12);
+    const float32x4_t x4 = vld1q_f32(feat_in + 16);
+    const float32x4_t x5 = vld1q_f32(feat_in + 20);
+
+    const int base = ev_y * Wl + ev_x;
+    constexpr int dx_arr[9] = {-1, 0, 1, -1, 0, 1, -1, 0, 1};
+    constexpr int dy_arr[9] = {-1, -1, -1, 0, 0, 0, 1, 1, 1};
+    constexpr int delta_arr[9] = {8, 7, 6, 5, 4, 3, 2, 1, 0};
+
+    for (int k = 0; k < 9; ++k) {
+        const int patch_idx = base + dy_arr[k] * Wl + dx_arr[k];
+        const int pos       = delta_arr[k];
+        patch_24_24_tiled_state_only(x0, x1, x2, x3, x4, x5,
+                                     qvgIn_arr[pos].data(),
+                                     H_all + (std::ptrdiff_t)patch_idx * 24);
+    }
+}
+
 
 // ============================================================================
 // Original (not-tiled) patch_24_24 kept below for back-compat / boundary path.
