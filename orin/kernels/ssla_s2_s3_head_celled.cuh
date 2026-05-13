@@ -69,6 +69,7 @@ struct GpuTimingSlot {
     unsigned int       seq;
     unsigned int       owner;
     unsigned long long t_push_ns;   // copied from HybridInputRec at process time
+    unsigned long long t_emit_ns;   // synth/camera emit time (whole-pipeline anchor)
 };
 
 // Max GPU blocks the runtime supports. Bumped from 2 → 16 so each block can
@@ -107,7 +108,8 @@ struct HybridInputRec {
     unsigned short     x;
     unsigned short     y;
     float              feat1[24];
-    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at ring publish
+    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at GPU-ring publish
+    unsigned long long t_emit_ns;    // ns at synth/camera emit (BEFORE CPU stages)
 };
 
 struct HybridS2S3OutputSlot {
@@ -349,8 +351,9 @@ struct EventSlot {
     int   is_owner;
     int   pass2;
     int   pass3;
-    int   _pad;                  // keep 8-byte alignment for the u64 below
+    int   _pad;                  // keep 8-byte alignment for the u64s below
     unsigned long long t_push_ns; // copy of HybridInputRec.t_push_ns at load
+    unsigned long long t_emit_ns; // copy of HybridInputRec.t_emit_ns at load
 };
 
 
@@ -883,6 +886,7 @@ void k_ssla_s2s3_celled_drain_n(
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
+                event_slots[e].t_emit_ns = rec.t_emit_ns;
             }
         }
         __syncthreads();
@@ -1044,6 +1048,7 @@ void k_ssla_s2s3_celled_drain_n_multi(
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
+                event_slots[e].t_emit_ns = rec.t_emit_ns;
             }
         }
         __syncthreads();
@@ -1251,6 +1256,7 @@ void k_ssla_s2s3_celled_persistent(
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
+                event_slots[e].t_emit_ns = rec.t_emit_ns;
             }
         }
         __syncthreads();
@@ -1352,6 +1358,7 @@ void k_ssla_s2s3_celled_persistent(
                 // start) rather than the ring directly — the ring may have
                 // wrapped by now and the slot may contain a newer event.
                 ts->t_push_ns = event_slots[e].t_push_ns;
+                ts->t_emit_ns = event_slots[e].t_emit_ns;
             }
         }
         __syncthreads();
@@ -1485,6 +1492,7 @@ void k_ssla_s2s3_celled_persistent_multi(
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
+                event_slots[e].t_emit_ns = rec.t_emit_ns;
             }
         }
         __syncthreads();
@@ -1572,6 +1580,7 @@ void k_ssla_s2s3_celled_persistent_multi(
                                         && (pass3[e] != 0);
                 ts->owner = owner_pass3 ? 1u : 0u;
                 ts->t_push_ns = event_slots[e].t_push_ns;
+                ts->t_emit_ns = event_slots[e].t_emit_ns;
             }
         }
         __syncthreads();

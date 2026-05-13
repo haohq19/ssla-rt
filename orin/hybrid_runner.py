@@ -349,7 +349,7 @@ def main() -> int:
         BATCH_K = 8
         N_WARPS_K = 9
         OUT_MAX_K = C3
-        event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8  # 5 ints + pad + u64
+        event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
         SMEM = (event_slot * BATCH_K
                 + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
                 + N_WARPS_K * OUT_MAX_K * 4

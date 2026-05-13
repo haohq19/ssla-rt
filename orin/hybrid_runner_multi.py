@@ -147,7 +147,7 @@ def main():
     func = mod.get_function("k_ssla_s2s3_celled_persistent_multi")
     threads_pb = 9 * 32
     BATCH_K, N_WARPS_K, OUT_MAX_K = 8, 9, C3
-    event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8
+    event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8 + 8
     SMEM = (event_slot * BATCH_K
             + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
             + N_WARPS_K * OUT_MAX_K * 4
@@ -262,6 +262,57 @@ def main():
         head = _read_u64(ring_head[b])
         done = _read_u64(events_done[b])
         print(f"  blk{b}: head={head:8d} done={done:8d} lag={head-done}")
+
+    # ---- 8. End-to-end latency from timing slots --------------------------
+    # Three components per timing slot:
+    #   emit→push  = CPU pipeline latency (synth/camera → CPU stage 0+1 → GPU ring publish)
+    #   push→done  = GPU pipeline latency (ring wait + 4 GPU layers)
+    #   emit→done  = whole pipeline latency
+    # GPU-side t_done_clk is in SM cycles — translated via the per-block
+    # two-point calibration (kernel_start_clk + kernel_end_clk anchored
+    # against CPU CLOCK_MONOTONIC_RAW recorded at launch / sync).
+    print(f"\n[latency] WHOLE pipeline (emit → GPU done), per block:")
+    print(f"{'blk':>3} | {'n_owner':>7} | "
+          f"{'emit→push':>10} {'push→done':>10} {'emit→done':>10} (µs p50/p99/max)")
+    cyc0 = [int(kstart_view[b][0]) for b in range(args.gpu_blocks)]
+    cyc1 = [int(kend_view[b][0])   for b in range(args.gpu_blocks)]
+    for b in range(args.gpu_blocks):
+        tv = timing_view[b]
+        valid = (tv["t_done_clk"] != 0) & (tv["t_emit_ns"] != 0) & (tv["t_push_ns"] != 0)
+        if not valid.any():
+            print(f"{b:>3} | (no samples)")
+            continue
+        idx = np.nonzero(valid)[0]
+        head_skip = max(1, len(idx) // 20); tail_skip = max(1, len(idx) // 20)
+        idx = idx[head_skip:-tail_skip] if len(idx) > head_skip + tail_skip else idx
+
+        cyc_span = max(1, cyc1[b] - cyc0[b])
+        ns_span  = max(1, t_exit_cpu_ns - t_anchor_cpu_ns)
+        ns_per_cycle = ns_span / cyc_span
+        dt_cyc = (tv["t_done_clk"][idx].astype(np.int64) - cyc0[b]).astype(np.float64)
+        t_done_ns_cpu = t_anchor_cpu_ns + dt_cyc * ns_per_cycle
+
+        t_push = tv["t_push_ns"][idx].astype(np.int64).astype(np.float64)
+        t_emit = tv["t_emit_ns"][idx].astype(np.int64).astype(np.float64)
+
+        emit_to_push = (t_push - t_emit) / 1000.0
+        push_to_done = (t_done_ns_cpu - t_push) / 1000.0
+        emit_to_done = (t_done_ns_cpu - t_emit) / 1000.0
+
+        owner_mask = tv["owner"][idx] == 1
+        def _pct3(arr, mask):
+            sub = arr[mask] if mask.any() else arr
+            if sub.size == 0:
+                return "n/a", "n/a", "n/a"
+            return (f"{float(np.percentile(sub,50)):>4.0f}",
+                    f"{float(np.percentile(sub,99)):>4.0f}",
+                    f"{float(sub.max()):>4.0f}")
+        a50, a99, amx = _pct3(emit_to_push, owner_mask)
+        b50, b99, bmx = _pct3(push_to_done, owner_mask)
+        c50, c99, cmx = _pct3(emit_to_done, owner_mask)
+        n_owner = int(owner_mask.sum())
+        print(f"{b:>3} | {n_owner:>7d} | "
+              f"{a50}/{a99}/{amx} {b50}/{b99}/{bmx} {c50}/{c99}/{cmx}")
 
 
 if __name__ == "__main__":

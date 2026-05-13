@@ -47,16 +47,17 @@ constexpr int MAX_GPU_BLOCKS = 16;
 // Legacy default for the existing s01g_attach_gpu_rings 2-ring API.
 constexpr int N_GPU_BLOCKS_DEFAULT = 2;
 
-// Must match HybridInputRec in ssla_s2_s3_head.cuh (120 bytes).
+// Must match HybridInputRec in ssla_s2_s3_head.cuh (128 bytes).
 struct HybridInputRec {
     std::uint64_t  seq_done;
     float          t;
     std::uint16_t  x;
     std::uint16_t  y;
     float          feat1[24];   // C1 = 24
-    std::uint64_t  t_push_ns;   // CPU CLOCK_MONOTONIC_RAW ns at ring publish
+    std::uint64_t  t_push_ns;   // CPU CLOCK_MONOTONIC_RAW ns at GPU-ring publish
+    std::uint64_t  t_emit_ns;   // CPU CLOCK_MONOTONIC_RAW ns at synth/camera emit
 };
-static_assert(sizeof(HybridInputRec) == 120, "HybridInputRec layout drift");
+static_assert(sizeof(HybridInputRec) == 128, "HybridInputRec layout drift");
 
 // Wallclock at ring-publish moment, used as the per-event arrival timestamp.
 // Same clock domain (CLOCK_MONOTONIC_RAW) used to calibrate the GPU SM-clock
@@ -84,7 +85,8 @@ void pin_to_core(int core_id) {
 }
 
 struct ShardMsg {
-    std::uint64_t  t_arr_tsc;
+    std::uint64_t  t_arr_tsc;     // rdtsc/steady_clock at CPU shard-ring push (legacy)
+    std::uint64_t  t_emit_ns;     // CLOCK_MONOTONIC_RAW ns at synth/camera emit
     openeva::Event ev;
     bool           is_owner;
     bool           eof;
@@ -292,13 +294,17 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
                         dst->y = static_cast<std::uint16_t>(s2y);
                         std::memcpy(dst->feat1, feat1.data(),
                                     sizeof(float) * 24);
-                        // Stamp arrival time immediately before publish so
-                        // latency = (GPU done time) - t_push_ns captures the
-                        // full ring-wait + GPU compute window.
+                        // Stamp publish-time + propagate emit-time. The GPU
+                        // timing path records both, so we can separate:
+                        //   emit→push   = CPU pipeline latency (stage 0+1
+                        //                 + halo + shard hop)
+                        //   push→done   = GPU pipeline latency
+                        //   emit→done   = whole pipeline latency
                         dst->t_push_ns = mono_raw_ns();
+                        dst->t_emit_ns = m.t_emit_ns;
                         // Release-store seq_done; ensures record fields
-                        // (including t_push_ns) are visible before consumer
-                        // observes the tag.
+                        // (including t_push_ns + t_emit_ns) are visible
+                        // before consumer observes the tag.
                         __atomic_store_n(&dst->seq_done, slot + 1ull,
                                           __ATOMIC_RELEASE);
                         gb.n_pushed.fetch_add(1, std::memory_order_relaxed);
@@ -517,6 +523,7 @@ int s01g_submit_batch(S01gHandle* h, const float* events_packed, int n) {
             if (ex < lo || ex >= hi) continue;
             ShardMsg m;
             m.t_arr_tsc = t_arr;
+            m.t_emit_ns = mono_raw_ns();
             m.ev.t = t;
             m.ev.x = x;
             m.ev.y = y;
@@ -676,6 +683,7 @@ void synth_thread_main(S01gHandle* h, double rate_mev, int pin_core,
             if (ex < lo || ex >= hi) continue;
             ShardMsg m;
             m.t_arr_tsc = t_arr;
+            m.t_emit_ns = mono_raw_ns();
             m.ev.t = ev_t_us;
             m.ev.x = static_cast<float>(ex);
             m.ev.y = static_cast<float>(ey);

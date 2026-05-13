@@ -28,14 +28,15 @@ C1, C2, C3 = 24, 48, 96
 
 # ---- numpy dtypes (mirror the CUDA structs) --------------------------------
 INPUT_DTYPE = np.dtype([
-    ("seq_done", "<u8"),
-    ("t",        "<f4"),
-    ("x",        "<u2"),
-    ("y",        "<u2"),
-    ("feat1",    "<f4", (C1,)),
+    ("seq_done",  "<u8"),
+    ("t",         "<f4"),
+    ("x",         "<u2"),
+    ("y",         "<u2"),
+    ("feat1",     "<f4", (C1,)),
     ("t_push_ns", "<u8"),
+    ("t_emit_ns", "<u8"),
 ])
-assert INPUT_DTYPE.itemsize == 120, INPUT_DTYPE.itemsize
+assert INPUT_DTYPE.itemsize == 128, INPUT_DTYPE.itemsize
 
 OUTPUT_DTYPE = np.dtype([
     ("pass2",   "<i4"),
@@ -104,8 +105,9 @@ TIMING_DTYPE = np.dtype([
     ("seq",        "<u4"),
     ("owner",      "<u4"),
     ("t_push_ns",  "<u8"),
+    ("t_emit_ns",  "<u8"),
 ])
-assert TIMING_DTYPE.itemsize == 32
+assert TIMING_DTYPE.itemsize == 40
 
 
 HEAD_OUT_DEFAULT = 7    # 5 box + 2 cls (Gen1)

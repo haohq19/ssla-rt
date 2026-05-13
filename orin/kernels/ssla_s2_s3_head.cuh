@@ -56,9 +56,10 @@ struct HybridStrip {
 struct GpuTimingSlot {
     unsigned long long t_pop_clk;
     unsigned long long t_done_clk;
-    unsigned int       seq;     // event seq (logical pop position)
-    unsigned int       owner;   // 1 if owner-pass-3 reached head; 0 otherwise
-    unsigned long long t_push_ns;   // copied from HybridInputRec at process time
+    unsigned int       seq;
+    unsigned int       owner;
+    unsigned long long t_push_ns;
+    unsigned long long t_emit_ns;
 };
 
 // Shared config readable by both blocks.
@@ -107,7 +108,8 @@ struct HybridInputRec {
     unsigned short     x;            // s2-res x
     unsigned short     y;            // s2-res y
     float              feat1[24];    // C1 = 24 features post-CPU-stage-1
-    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at ring publish
+    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at GPU-ring publish
+    unsigned long long t_emit_ns;    // ns at synth/camera emit (BEFORE CPU stages)
 };
 
 // Per-event debug output (P1 diff). The kernel writes it for both

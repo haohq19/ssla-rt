@@ -58,7 +58,8 @@ struct GpuTimingSlot {
     unsigned long long t_done_clk;
     unsigned int       seq;
     unsigned int       owner;
-    unsigned long long t_push_ns;   // copied from HybridInputRec at process time
+    unsigned long long t_push_ns;
+    unsigned long long t_emit_ns;
 };
 
 // Must match MAX_BLOCKS in ssla_s2_s3_head_celled.cuh.
@@ -93,7 +94,8 @@ struct HybridInputRec {
     unsigned short     x;
     unsigned short     y;
     float              feat1[24];
-    unsigned long long t_push_ns;    // CPU CLOCK_MONOTONIC_RAW ns at ring publish
+    unsigned long long t_push_ns;
+    unsigned long long t_emit_ns;
 };
 
 struct HybridS2S3OutputSlot {

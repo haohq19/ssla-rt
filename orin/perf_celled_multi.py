@@ -39,7 +39,7 @@ KERNELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"
 
 
 def _smem_size_bytes() -> int:
-    event_slot = OUT_MAX * 4 + OUT_MAX * 4 + 5 * 4 + 4 + 8  # 5 ints + pad + u64
+    event_slot = OUT_MAX * 4 + OUT_MAX * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
     smem = (
         event_slot * BATCH
         + BATCH * N_WARPS * OUT_MAX * 4
