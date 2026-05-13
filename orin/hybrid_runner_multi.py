@@ -1,0 +1,268 @@
+"""Multi-block live runner: launches k_ssla_s2s3_celled_persistent_multi
+with N independent rings + N CPU shards routed by 2D (x, y) cell ownership.
+
+Mirrors hybrid_runner.py's structure but parametrised on --gpu-blocks
+∈ {2, 4, 8}. For 2 it's equivalent to the legacy 2-block path with
+H_owned = [0, H2) on both strips.
+"""
+import argparse
+import ctypes
+import os
+import sys
+import signal
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from orin import cuda_util  # noqa: E402
+from orin.nvrtc_util import CudaModule, arg_ptr, arg_u32, arg_u64  # noqa: E402
+from orin.hybrid_common import (  # noqa: E402
+    INPUT_DTYPE, OUTPUT_DTYPE, TIMING_DTYPE,
+    C1, C2, C3, MAX_BLOCKS, HEAD_OUT_DEFAULT,
+    build_head_weights, S01gAPI,
+)
+from orin.multi_block import (  # noqa: E402
+    BlockTopo, grid_topology, build_n_block_random_layers,
+    alloc_tdrop_n_block, alloc_predictions_n_block,
+    alloc_timing_n_block, alloc_kernel_clk_n_block,
+    build_n_block_config,
+)
+
+
+SM_CLK_HZ = 918_000_000
+LIB_PATH = "/home/nanod/ssla-rt/build/libstage01_to_gpu.so"
+KERNELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels")
+
+
+def _alloc_u64():
+    p, _ka = cuda_util.alloc_pinned(8)
+    ctypes.memset(p, 0, 8)
+    return p
+
+
+def _write_i32(devptr, val):
+    arr = (ctypes.c_int32 * 1).from_address(devptr)
+    arr[0] = val
+
+
+def _read_u64(devptr):
+    arr = (ctypes.c_uint64 * 1).from_address(devptr)
+    return int(arr[0])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--h-full", type=int, default=64)
+    ap.add_argument("--w-full", type=int, default=80)
+    ap.add_argument("--gpu-blocks", type=int, default=8, choices=[2, 4, 8])
+    ap.add_argument("--shards", type=int, default=6)
+    ap.add_argument("--halo", type=int, default=2)
+    ap.add_argument("--base-core", type=int, default=1)
+    ap.add_argument("--pin-python-main", action="store_true")
+    ap.add_argument("--python-pin-core", type=int, default=0)
+    ap.add_argument("--cpp-synth", action="store_true")
+    ap.add_argument("--synth-pin-core", type=int, default=7)
+    ap.add_argument("--shard-ring-cap", type=int, default=16)
+    ap.add_argument("--tdrop", type=int, default=4)
+    ap.add_argument("--ring-cap", type=int, default=1 << 16)
+    ap.add_argument("--spin-ns", type=int, default=200)
+    ap.add_argument("--duration-s", type=float, default=10.0)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--timing-cap", type=int, default=1 << 14)
+    ap.add_argument("--synthetic-mev", type=float, default=2.0)
+    args = ap.parse_args()
+
+    if args.pin_python_main:
+        os.sched_setaffinity(0, {args.python_pin_core})
+
+    H_full, W_full = args.h_full, args.w_full
+    H2, W2 = H_full >> 2, W_full >> 2
+    H3, W3 = H2 >> 1, W2 >> 1
+    print(f"Geometry: full {W_full}×{H_full}  s2 {W2}×{H2}  s3 {W3}×{H3}",
+          flush=True)
+
+    topo = grid_topology(args.gpu_blocks, W2, H2)
+    print(f"Topology: {args.gpu_blocks} blocks", flush=True)
+    for i, t in enumerate(topo):
+        print(f"  blk{i}: owned X[{t.owned_x_lo},{t.owned_x_hi}) "
+              f"Y[{t.owned_y_lo},{t.owned_y_hi}) "
+              f"proc X[{t.proc_x_lo},{t.proc_x_hi}) Y[{t.proc_y_lo},{t.proc_y_hi})")
+
+    # ---- 1. GPU resources --------------------------------------------------
+    rng = np.random.default_rng(args.seed)
+    cpu_layers, gpu_layers, ka_layers = build_n_block_random_layers(
+        rng, args.gpu_blocks, H2, W2, H3, W3)
+    tdrop_s2_dev, tdrop_s3_dev, ka_tdrop = alloc_tdrop_n_block(
+        H2, W2, H3, W3, args.gpu_blocks)
+    head_W_dev, head_b_dev, ka_head = build_head_weights(rng, HEAD_OUT_DEFAULT)
+    preds_dev, preds_view, version_dev, version_view, ka_preds = \
+        alloc_predictions_n_block(topo, HEAD_OUT_DEFAULT)
+    timing_dev, timing_view, timing_mask, ka_timing = alloc_timing_n_block(
+        args.timing_cap, args.gpu_blocks)
+    kstart_dev, kstart_view, kend_dev, kend_view, ka_kclk = \
+        alloc_kernel_clk_n_block(args.gpu_blocks)
+    keepalive = list(ka_layers) + list(ka_tdrop) + list(ka_head) \
+              + list(ka_preds) + list(ka_timing) + list(ka_kclk)
+
+    p_cfg, ka_cfg = build_n_block_config(
+        H2, W2, H3, W3, args.tdrop,
+        gpu_layers, tdrop_s2_dev, tdrop_s3_dev, topo,
+        head_W=head_W_dev, head_b=head_b_dev,
+        preds_dev=preds_dev, version_dev=version_dev,
+        timing_dev=timing_dev, timing_mask=timing_mask,
+        kernel_start_clk=kstart_dev, kernel_end_clk=kend_dev,
+    )
+    keepalive.append(ka_cfg)
+
+    # ---- 2. Pinned rings + tails + events_done ----------------------------
+    rec_bytes = INPUT_DTYPE.itemsize
+    ring_nbytes = args.ring_cap * rec_bytes
+    print(f"\nPinned alloc: {args.gpu_blocks} × ring "
+          f"({ring_nbytes/1e6:.1f} MB each)", flush=True)
+    ring_dev, ring_view, ring_head, ring_tail, events_done = [], [], [], [], []
+    for b in range(args.gpu_blocks):
+        p, ka = cuda_util.alloc_pinned(ring_nbytes)
+        ctypes.memset(p, 0, ring_nbytes)
+        keepalive.append(ka)
+        ring_dev.append(p)
+        ring_view.append(np.frombuffer(ka, dtype=INPUT_DTYPE).reshape(-1))
+        ring_head.append(_alloc_u64())
+        ring_tail.append(_alloc_u64())
+        events_done.append(_alloc_u64())
+    stop_flag, _ka_stop = cuda_util.alloc_pinned(4)
+    ctypes.memset(stop_flag, 0, 4)
+    keepalive.append(_ka_stop)
+
+    # ---- 3. Compile + launch persistent_multi kernel ----------------------
+    src   = open(os.path.join(KERNELS_DIR, "ssla_s2_s3_head_celled.cuh")).read()
+    proto = open(os.path.join(KERNELS_DIR, "proto_layer_pair.cuh")).read()
+    print(f"Compiling celled kernel ...", flush=True)
+    t0 = time.monotonic()
+    mod = CudaModule(src, name="ssla_s2_s3_head_celled.cu",
+                     headers={"proto_layer_pair.cuh": proto})
+    print(f"  cache {mod.cache_status} in {time.monotonic()-t0:.1f}s",
+          flush=True)
+    func = mod.get_function("k_ssla_s2s3_celled_persistent_multi")
+    threads_pb = 9 * 32
+    BATCH_K, N_WARPS_K, OUT_MAX_K = 8, 9, C3
+    event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8
+    SMEM = (event_slot * BATCH_K
+            + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
+            + N_WARPS_K * OUT_MAX_K * 4
+            + N_WARPS_K * OUT_MAX_K * 4
+            + N_WARPS_K * BATCH_K * 4
+            + N_WARPS_K * BATCH_K * 4
+            + N_WARPS_K * 4
+            + BATCH_K * 4
+            + BATCH_K * 4)
+    SMEM = ((SMEM + 15) // 16) * 16
+
+    # Pointer arrays for kernel: rings[], tails[], events_dones[].
+    def _alloc_ptr_array(values):
+        nbytes = args.gpu_blocks * 8
+        p, ka = cuda_util.alloc_managed(nbytes)
+        view = np.frombuffer(ka, dtype=np.uint64).reshape(-1)
+        view[:] = values
+        keepalive.append(ka)
+        return p
+
+    rings_arr_dev = _alloc_ptr_array(ring_dev)
+    tails_arr_dev = _alloc_ptr_array(ring_tail)
+    edone_arr_dev = _alloc_ptr_array(events_done)
+
+    print(f"Launching: gridDim={args.gpu_blocks}, blockDim={threads_pb}, "
+          f"smem={SMEM} B", flush=True)
+    t_launch_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    func.launch((args.gpu_blocks, 1, 1), (threads_pb, 1, 1), [
+        arg_ptr(p_cfg),
+        arg_ptr(rings_arr_dev),
+        arg_u64(args.ring_cap - 1),
+        arg_ptr(tails_arr_dev),
+        arg_ptr(stop_flag),
+        arg_ptr(edone_arr_dev),
+        arg_u32(args.spin_ns),
+    ], smem=SMEM)
+
+    # Busy-spin for kernel_start_clk anchor.
+    t_dead = time.monotonic() + 2.0
+    while True:
+        if all(int(kstart_view[b][0]) != 0 for b in range(args.gpu_blocks)):
+            break
+        if time.monotonic() > t_dead:
+            print("[warn] kernel_start_clk timeout"); break
+    t_anchor_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    print(f"[anchor] launch→anchor = "
+          f"{(t_anchor_cpu_ns-t_launch_cpu_ns)/1000:.1f} µs", flush=True)
+
+    # ---- 4. Init libstage01_to_gpu and attach multi rings -----------------
+    api = S01gAPI(LIB_PATH)
+    api.init(args.weights, n_shards=args.shards, halo=args.halo,
+             base_core=args.base_core, sample_cap=65536,
+             shard_ring_cap=args.shard_ring_cap)
+    proc_x_los = [t.proc_x_lo for t in topo]
+    proc_x_his = [t.proc_x_hi for t in topo]
+    proc_y_los = [t.proc_y_lo for t in topo]
+    proc_y_his = [t.proc_y_hi for t in topo]
+    api.attach_multi(ring_dev, ring_head, args.ring_cap - 1, W2, H2,
+                      proc_x_los, proc_x_his, proc_y_los, proc_y_his)
+    api.reset()
+    print("CPU + GPU rings attached", flush=True)
+
+    # ---- 5. Synth source --------------------------------------------------
+    if args.cpp_synth:
+        api.lib.s01g_start_synthetic(api.handle,
+            ctypes.c_double(args.synthetic_mev),
+            ctypes.c_int(args.synth_pin_core),
+            ctypes.c_uint64(args.seed))
+        print(f"C++ synth dispatcher @ {args.synthetic_mev:.2f} Mev/s "
+              f"(pin core {args.synth_pin_core})", flush=True)
+
+    stop_flag_view = (ctypes.c_int32 * 1).from_address(stop_flag)
+
+    def on_sigint(sig, frame):
+        print("\n[SIGINT] stopping", flush=True)
+        stop_flag_view[0] = 1
+    signal.signal(signal.SIGINT, on_sigint)
+
+    # ---- 6. Run for duration_s, periodic stats ----------------------------
+    t_run_start = time.monotonic()
+    t_next_stats = t_run_start + 1.0
+    print(f"\n{'t':>5} | {'kev/s GPU':>10} | "
+          + " ".join(f"d{b}" for b in range(args.gpu_blocks))
+          + " | CPU per-block n_pushed", flush=True)
+    last_done = [0] * args.gpu_blocks
+    while time.monotonic() - t_run_start < args.duration_s:
+        if time.monotonic() >= t_next_stats:
+            done = [_read_u64(events_done[b]) for b in range(args.gpu_blocks)]
+            dones = [done[b] - last_done[b] for b in range(args.gpu_blocks)]
+            total = sum(dones)
+            print(f"{time.monotonic()-t_run_start:5.1f}s | {total/1e3:10.1f} | "
+                  + " ".join(f"{d:6d}" for d in dones), flush=True)
+            last_done = done
+            t_next_stats += 1.0
+        time.sleep(0.05)
+
+    print("[main] duration reached, stopping", flush=True)
+    if args.cpp_synth:
+        api.lib.s01g_stop_synthetic(api.handle)
+    stop_flag_view[0] = 1
+    from cuda import cuda
+    err, = cuda.cuCtxSynchronize()
+    t_exit_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    print(f"[main] cuCtxSynchronize: {err}", flush=True)
+    api.shutdown()
+
+    # ---- 7. Final stats ---------------------------------------------------
+    head_done = sum(_read_u64(events_done[b]) for b in range(args.gpu_blocks))
+    print(f"\n[final] total events_done across {args.gpu_blocks} blocks = "
+          f"{head_done}  → {head_done/args.duration_s/1e3:.1f} kev/s avg")
+    for b in range(args.gpu_blocks):
+        head = _read_u64(ring_head[b])
+        done = _read_u64(events_done[b])
+        print(f"  blk{b}: head={head:8d} done={done:8d} lag={head-done}")
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

@@ -47,6 +47,10 @@ struct HybridStrip {
     int owned_hi;
     int s3_owned_lo;
     int s3_owned_hi;
+    int owned_y_lo;
+    int owned_y_hi;
+    int s3_owned_y_lo;
+    int s3_owned_y_hi;
 };
 
 struct GpuTimingSlot {

@@ -42,7 +42,10 @@
 
 namespace {
 
-constexpr int N_GPU_BLOCKS = 2;
+// Compile-time upper bound; runtime block count is h->n_gpu_blocks.
+constexpr int MAX_GPU_BLOCKS = 16;
+// Legacy default for the existing s01g_attach_gpu_rings 2-ring API.
+constexpr int N_GPU_BLOCKS_DEFAULT = 2;
 
 // Must match HybridInputRec in ssla_s2_s3_head.cuh (120 bytes).
 struct HybridInputRec {
@@ -92,8 +95,10 @@ using ShardRing = deploy::SpscRing<ShardMsg>;
 struct GpuBlockCfg {
     HybridInputRec*     ring_buf;        // pinned host alloc, indexed mod ring_capacity
     std::uint64_t*      ring_head;       // pinned host atomic counter
-    int                 proc_lo;         // s2-x processing range (inclusive)
-    int                 proc_hi;         // exclusive
+    int                 proc_x_lo;       // s2-x processing range (inclusive)
+    int                 proc_x_hi;       // exclusive
+    int                 proc_y_lo;       // s2-y processing range (inclusive)
+    int                 proc_y_hi;       // exclusive
     std::atomic<std::uint64_t> n_pushed{0};
 };
 
@@ -162,10 +167,11 @@ struct S01gHandle {
     std::atomic<std::uint64_t> n_oob{0};
     std::chrono::steady_clock::time_point t_start_or_reset;
 
-    // GPU side — populated by s01g_attach_gpu_rings(). Until attached,
-    // workers do not push to any GPU ring (pure CPU mode).
+    // GPU side — populated by s01g_attach_gpu_rings() or _multi().
+    // n_gpu_blocks is the runtime count; <= MAX_GPU_BLOCKS.
     std::atomic<bool> gpu_attached{false};
-    GpuBlockCfg gpu_block[N_GPU_BLOCKS];
+    GpuBlockCfg gpu_block[MAX_GPU_BLOCKS];
+    int             n_gpu_blocks = 0;
     int             gpu_W2 = 0;
     int             gpu_H2 = 0;
     std::uint64_t   gpu_ring_mask = 0;
@@ -273,9 +279,10 @@ void shard_worker(S01gHandle* h, ShardCtx* ctx) {
                 const int s2y = y;
                 if (s2x >= 0 && s2x < h->gpu_W2 &&
                     s2y >= 0 && s2y < h->gpu_H2) {
-                    for (int b = 0; b < N_GPU_BLOCKS; ++b) {
+                    for (int b = 0; b < h->n_gpu_blocks; ++b) {
                         GpuBlockCfg& gb = h->gpu_block[b];
-                        if (s2x < gb.proc_lo || s2x >= gb.proc_hi) continue;
+                        if (s2x < gb.proc_x_lo || s2x >= gb.proc_x_hi) continue;
+                        if (s2y < gb.proc_y_lo || s2y >= gb.proc_y_hi) continue;
                         const std::uint64_t slot = __atomic_fetch_add(
                             gb.ring_head, 1ull, __ATOMIC_RELAXED);
                         HybridInputRec* dst = gb.ring_buf
@@ -428,16 +435,56 @@ void s01g_attach_gpu_rings(S01gHandle* h,
                             int proc_lo_0, int proc_hi_0,
                             int proc_lo_1, int proc_hi_1) {
     if (!h) return;
+    h->n_gpu_blocks = N_GPU_BLOCKS_DEFAULT;   // = 2
     h->gpu_block[0].ring_buf  = static_cast<HybridInputRec*>(ring_buf_0);
     h->gpu_block[0].ring_head = static_cast<std::uint64_t*>(ring_head_0);
-    h->gpu_block[0].proc_lo   = proc_lo_0;
-    h->gpu_block[0].proc_hi   = proc_hi_0;
+    h->gpu_block[0].proc_x_lo = proc_lo_0;
+    h->gpu_block[0].proc_x_hi = proc_hi_0;
+    h->gpu_block[0].proc_y_lo = 0;
+    h->gpu_block[0].proc_y_hi = H2;
     h->gpu_block[0].n_pushed.store(0, std::memory_order_relaxed);
     h->gpu_block[1].ring_buf  = static_cast<HybridInputRec*>(ring_buf_1);
     h->gpu_block[1].ring_head = static_cast<std::uint64_t*>(ring_head_1);
-    h->gpu_block[1].proc_lo   = proc_lo_1;
-    h->gpu_block[1].proc_hi   = proc_hi_1;
+    h->gpu_block[1].proc_x_lo = proc_lo_1;
+    h->gpu_block[1].proc_x_hi = proc_hi_1;
+    h->gpu_block[1].proc_y_lo = 0;
+    h->gpu_block[1].proc_y_hi = H2;
     h->gpu_block[1].n_pushed.store(0, std::memory_order_relaxed);
+    h->gpu_ring_mask = ring_mask;
+    h->gpu_W2 = W2;
+    h->gpu_H2 = H2;
+    std::atomic_thread_fence(std::memory_order_release);
+    h->gpu_attached.store(true, std::memory_order_release);
+}
+
+
+// Multi-block attach. n_blocks ≤ MAX_GPU_BLOCKS. Each ring_bufs[i] is the
+// per-block pinned-host ring (sized to ring_capacity records), each
+// ring_heads[i] is the per-block u64 head counter, and proc_{x,y}_{lo,hi}
+// give the per-block s2-grid processing range. An event with s2 coords
+// (x, y) is pushed to block i iff (proc_x_lo[i] <= x < proc_x_hi[i]) AND
+// (proc_y_lo[i] <= y < proc_y_hi[i]). Halo overlap is encoded by
+// overlapping ranges across blocks.
+extern "C"
+void s01g_attach_gpu_rings_multi(S01gHandle* h,
+                                  int n_blocks,
+                                  void* const* ring_bufs,
+                                  void* const* ring_heads,
+                                  unsigned long long ring_mask,
+                                  int W2, int H2,
+                                  const int* proc_x_los, const int* proc_x_his,
+                                  const int* proc_y_los, const int* proc_y_his) {
+    if (!h || n_blocks <= 0 || n_blocks > MAX_GPU_BLOCKS) return;
+    h->n_gpu_blocks = n_blocks;
+    for (int b = 0; b < n_blocks; ++b) {
+        h->gpu_block[b].ring_buf  = static_cast<HybridInputRec*>(ring_bufs[b]);
+        h->gpu_block[b].ring_head = static_cast<std::uint64_t*>(ring_heads[b]);
+        h->gpu_block[b].proc_x_lo = proc_x_los[b];
+        h->gpu_block[b].proc_x_hi = proc_x_his[b];
+        h->gpu_block[b].proc_y_lo = proc_y_los[b];
+        h->gpu_block[b].proc_y_hi = proc_y_his[b];
+        h->gpu_block[b].n_pushed.store(0, std::memory_order_relaxed);
+    }
     h->gpu_ring_mask = ring_mask;
     h->gpu_W2 = W2;
     h->gpu_H2 = H2;
@@ -675,7 +722,7 @@ void s01g_reset_stats(S01gHandle* h) {
             c->seg_count[s].store(0, std::memory_order_relaxed);
         }
     }
-    for (int b = 0; b < N_GPU_BLOCKS; ++b) {
+    for (int b = 0; b < h->n_gpu_blocks; ++b) {
         h->gpu_block[b].n_pushed.store(0, std::memory_order_relaxed);
     }
     h->n_oob.store(0, std::memory_order_relaxed);

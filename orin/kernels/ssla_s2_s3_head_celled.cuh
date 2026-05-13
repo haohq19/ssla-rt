@@ -51,10 +51,16 @@ struct LayerWeightsS2S3 {
 };
 
 struct HybridStrip {
-    int owned_lo;
-    int owned_hi;
-    int s3_owned_lo;
+    int owned_lo;          // s2-x owned range (inclusive)
+    int owned_hi;          // (exclusive)
+    int s3_owned_lo;       // s3-x owned (= owned_lo >> 1)
     int s3_owned_hi;
+    // 2-D ownership for multi-block live mode where blocks split BOTH H and W.
+    // Defaults of [0, H_full) for legacy 2-block / W-only-split configs.
+    int owned_y_lo;        // s2-y owned range (inclusive)
+    int owned_y_hi;        // (exclusive)
+    int s3_owned_y_lo;     // s3-y owned (= owned_y_lo >> 1)
+    int s3_owned_y_hi;
 };
 
 struct GpuTimingSlot {
@@ -870,8 +876,10 @@ void k_ssla_s2s3_celled_drain_n(
                 event_slots[e].evx = (int)rec.x;
                 event_slots[e].evy = (int)rec.y;
                 event_slots[e].is_owner =
-                    ((int)rec.x >= strip.owned_lo &&
-                     (int)rec.x <  strip.owned_hi) ? 1 : 0;
+                    ((int)rec.x >= strip.owned_lo   &&
+                     (int)rec.x <  strip.owned_hi   &&
+                     (int)rec.y >= strip.owned_y_lo &&
+                     (int)rec.y <  strip.owned_y_hi) ? 1 : 0;
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
@@ -1029,8 +1037,10 @@ void k_ssla_s2s3_celled_drain_n_multi(
                 event_slots[e].evx = (int)rec.x;
                 event_slots[e].evy = (int)rec.y;
                 event_slots[e].is_owner =
-                    ((int)rec.x >= strip.owned_lo &&
-                     (int)rec.x <  strip.owned_hi) ? 1 : 0;
+                    ((int)rec.x >= strip.owned_lo   &&
+                     (int)rec.x <  strip.owned_hi   &&
+                     (int)rec.y >= strip.owned_y_lo &&
+                     (int)rec.y <  strip.owned_y_hi) ? 1 : 0;
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
@@ -1234,8 +1244,10 @@ void k_ssla_s2s3_celled_persistent(
                 event_slots[e].evx = (int)rec.x;
                 event_slots[e].evy = (int)rec.y;
                 event_slots[e].is_owner =
-                    ((int)rec.x >= strip.owned_lo &&
-                     (int)rec.x <  strip.owned_hi) ? 1 : 0;
+                    ((int)rec.x >= strip.owned_lo   &&
+                     (int)rec.x <  strip.owned_hi   &&
+                     (int)rec.y >= strip.owned_y_lo &&
+                     (int)rec.y <  strip.owned_y_hi) ? 1 : 0;
                 event_slots[e].pass2 = 0;
                 event_slots[e].pass3 = 0;
                 event_slots[e].t_push_ns = rec.t_push_ns;
@@ -1304,10 +1316,12 @@ void k_ssla_s2s3_celled_persistent(
                 const int s3x = event_slots[e].evx;
                 const int s3y = event_slots[e].evy;
                 const int hx_local   = s3x - strip.s3_owned_lo;
-                const int s3_owned_w = strip.s3_owned_hi - strip.s3_owned_lo;
+                const int hy_local   = s3y - strip.s3_owned_y_lo;
+                const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
+                const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
                 if (hx_local >= 0 && hx_local < s3_owned_w &&
-                    s3y >= 0 && s3y < cfg.H3) {
-                    const int cell_idx = s3y * s3_owned_w + hx_local;
+                    hy_local >= 0 && hy_local < s3_owned_h) {
+                    const int cell_idx = hy_local * s3_owned_w + hx_local;
                     const long long off = (long long)cell_idx * HEAD_OUT;
                     if (lane < HEAD_OUT) {
                         cfg.preds[blk][off + lane] = head_local[0];
@@ -1343,6 +1357,225 @@ void k_ssla_s2s3_celled_persistent(
         __syncthreads();
 
         // ---- Advance tail ----
+        t_local += (unsigned long long)batch_size;
+        if (threadIdx.x == 0) {
+            *tail        = t_local;
+            *events_done = t_local;
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+}
+
+
+// ============================================================================
+// Multi-block persistent kernel.
+// Same logic as k_ssla_s2s3_celled_persistent but each block reads its
+// (ring, tail, events_done) from device pointer arrays indexed by blockIdx.x.
+// Allows live-mode launches with cfg.n_blocks > 2 to saturate all 8 SMs.
+// ============================================================================
+extern "C" __global__
+__launch_bounds__(N_WARPS * 32, 1)
+void k_ssla_s2s3_celled_persistent_multi(
+    const HybridS2S3Config*           cfg_in,
+    HybridInputRec* const*            rings,           // [n_blocks]
+    unsigned long long                ring_mask,
+    volatile unsigned long long**     tails,           // [n_blocks]
+    volatile int*                     stop_flag,
+    volatile unsigned long long**     events_dones,    // [n_blocks]
+    unsigned int                      spin_ns)
+{
+    const HybridS2S3Config& cfg = *cfg_in;
+    if (blockIdx.x >= cfg.n_blocks) return;
+    extern __shared__ float smem_raw[];
+    const int blk = blockIdx.x;
+    HybridInputRec*  ring        = rings[blk];
+    volatile unsigned long long* tail        = tails[blk];
+    volatile unsigned long long* events_done = events_dones[blk];
+
+    if (threadIdx.x == 0 && cfg.kernel_start_clk[blk] != 0) {
+        *cfg.kernel_start_clk[blk] = clock64();
+        __threadfence_system();
+    }
+
+    char* smem = (char*)smem_raw;
+    EventSlot* event_slots = (EventSlot*)smem;
+    char* p = smem + sizeof(EventSlot) * BATCH;
+    float* contrib = (float*)p;
+    p += BATCH * N_WARPS * OUT_MAX * sizeof(float);
+    float* per_warp_in_feat_sm = (float*)p;
+    p += N_WARPS * OUT_MAX * sizeof(float);
+    float* per_warp_qh_sm = (float*)p;
+    p += N_WARPS * OUT_MAX * sizeof(float);
+    int* task_event = (int*)p;
+    p += N_WARPS * BATCH * sizeof(int);
+    int* task_delta = (int*)p;
+    p += N_WARPS * BATCH * sizeof(int);
+    int* task_count = (int*)p;
+    p += N_WARPS * sizeof(int);
+    int* pass2 = (int*)p;
+    p += BATCH * sizeof(int);
+    int* pass3 = (int*)p;
+    p += BATCH * sizeof(int);
+    (void)task_event; (void)task_delta; (void)task_count;
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const HybridStrip& strip = cfg.strip[blk];
+
+    unsigned long long t_local = *tail;
+    __shared__ int want_stop;
+    __shared__ int batch_ready;
+    __shared__ int batch_size_sm;
+    __shared__ unsigned long long t_batch_pop;
+
+    while (true) {
+        if (threadIdx.x == 0) want_stop = *stop_flag;
+        __syncthreads();
+        if (want_stop) {
+            if (threadIdx.x == 0 && cfg.kernel_end_clk[blk] != 0) {
+                *cfg.kernel_end_clk[blk] = clock64();
+                __threadfence_system();
+            }
+            return;
+        }
+
+        if (threadIdx.x == 0) {
+            volatile unsigned long long* seq_p0 =
+                &ring[t_local & ring_mask].seq_done;
+            if (*seq_p0 != t_local + 1ull) {
+                batch_ready = 0;
+                __nanosleep(spin_ns);
+            } else {
+                int n_ready = 1;
+                for (int i = 1; i < BATCH; ++i) {
+                    volatile unsigned long long* seq_pi =
+                        &ring[(t_local + i) & ring_mask].seq_done;
+                    if (*seq_pi == t_local + i + 1ull) n_ready++;
+                    else break;
+                }
+                batch_size_sm = n_ready;
+                batch_ready   = 1;
+            }
+        }
+        __syncthreads();
+        if (!batch_ready) continue;
+
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            t_batch_pop = clock64();
+        }
+        __syncthreads();
+
+        const int batch_size = batch_size_sm;
+
+        for (int e = 0; e < batch_size; ++e) {
+            const HybridInputRec& rec = ring[(t_local + e) & ring_mask];
+            for (int i = threadIdx.x; i < OUT_MAX; i += blockDim.x) {
+                event_slots[e].in_feat[i] = (i < C1) ? rec.feat1[i] : 0.0f;
+            }
+            if (threadIdx.x == 0) {
+                event_slots[e].evx = (int)rec.x;
+                event_slots[e].evy = (int)rec.y;
+                event_slots[e].is_owner =
+                    ((int)rec.x >= strip.owned_lo   &&
+                     (int)rec.x <  strip.owned_hi   &&
+                     (int)rec.y >= strip.owned_y_lo &&
+                     (int)rec.y <  strip.owned_y_hi) ? 1 : 0;
+                event_slots[e].pass2 = 0;
+                event_slots[e].pass3 = 0;
+                event_slots[e].t_push_ns = rec.t_push_ns;
+            }
+        }
+        __syncthreads();
+
+        parallel_tdrop(batch_size, cfg.tdrop_window,
+                       cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
+                       pass2);
+        __syncthreads();
+
+        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*mask=*/0,
+                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*enter=*/0, /*output=*/pass2,
+                                  cfg.layers[blk][1], cfg.hidden[blk][1],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+
+        if (threadIdx.x == 0) {
+            for (int e = 0; e < batch_size; ++e) {
+                event_slots[e].evx >>= 1;
+                event_slots[e].evy >>= 1;
+            }
+        }
+        __syncthreads();
+
+        parallel_tdrop(batch_size, cfg.tdrop_window,
+                       cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
+                       pass3);
+        __syncthreads();
+
+        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*mask=*/pass2,
+                                  cfg.layers[blk][2], cfg.hidden[blk][2],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled_implicit_split<C3, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*enter=*/pass2, /*output=*/pass3,
+                                  cfg.layers[blk][3], cfg.hidden[blk][3],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+
+        constexpr int HEAD_OUT = HEAD_OUT_DEFAULT;
+        if (cfg.head_W != 0 && warp_id < batch_size) {
+            const int e = warp_id;
+            const bool owner_pass3 = (event_slots[e].is_owner != 0)
+                                    && (pass2[e] != 0)
+                                    && (pass3[e] != 0);
+            if (owner_pass3) {
+                constexpr int HEAD_K = (HEAD_OUT + 31) / 32;
+                float head_local[HEAD_K];
+                matvec_w<C3, HEAD_OUT>(event_slots[e].in_feat,
+                                       cfg.head_W, head_local);
+                if (lane < HEAD_OUT) head_local[0] += cfg.head_b[lane];
+
+                const int s3x = event_slots[e].evx;
+                const int s3y = event_slots[e].evy;
+                const int hx_local   = s3x - strip.s3_owned_lo;
+                const int hy_local   = s3y - strip.s3_owned_y_lo;
+                const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
+                const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
+                if (hx_local >= 0 && hx_local < s3_owned_w &&
+                    hy_local >= 0 && hy_local < s3_owned_h) {
+                    const int cell_idx = hy_local * s3_owned_w + hx_local;
+                    const long long off = (long long)cell_idx * HEAD_OUT;
+                    if (lane < HEAD_OUT) {
+                        cfg.preds[blk][off + lane] = head_local[0];
+                    }
+                    __syncwarp();
+                    if (lane == 0) cfg.version[blk][cell_idx] += 1u;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0 && cfg.timing[blk] != 0) {
+            const unsigned long long t_done = clock64();
+            for (int e = 0; e < batch_size; ++e) {
+                const unsigned long long seq = t_local + (unsigned long long)e;
+                const unsigned int idx = (unsigned int)(seq & cfg.timing_mask);
+                GpuTimingSlot* ts = &cfg.timing[blk][idx];
+                ts->t_pop_clk  = t_batch_pop;
+                ts->t_done_clk = t_done;
+                ts->seq        = (unsigned int)seq;
+                const bool owner_pass3 = (event_slots[e].is_owner != 0)
+                                        && (pass2[e] != 0)
+                                        && (pass3[e] != 0);
+                ts->owner = owner_pass3 ? 1u : 0u;
+                ts->t_push_ns = event_slots[e].t_push_ns;
+            }
+        }
+        __syncthreads();
+
         t_local += (unsigned long long)batch_size;
         if (threadIdx.x == 0) {
             *tail        = t_local;

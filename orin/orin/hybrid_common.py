@@ -48,10 +48,14 @@ OUTPUT_DTYPE = np.dtype([
 
 class CHybridStrip(ctypes.Structure):
     _fields_ = [
-        ("owned_lo",     ctypes.c_int32),
-        ("owned_hi",     ctypes.c_int32),
-        ("s3_owned_lo",  ctypes.c_int32),
-        ("s3_owned_hi",  ctypes.c_int32),
+        ("owned_lo",       ctypes.c_int32),
+        ("owned_hi",       ctypes.c_int32),
+        ("s3_owned_lo",    ctypes.c_int32),
+        ("s3_owned_hi",    ctypes.c_int32),
+        ("owned_y_lo",     ctypes.c_int32),
+        ("owned_y_hi",     ctypes.c_int32),
+        ("s3_owned_y_lo",  ctypes.c_int32),
+        ("s3_owned_y_hi",  ctypes.c_int32),
     ]
 
 
@@ -218,8 +222,12 @@ def build_config(H2: int, W2: int, H3: int, W3: int, tdrop_window: int,
     strip_w = W2 // N_BLOCKS
     cfg.strip[0].owned_lo,     cfg.strip[0].owned_hi    = 0,                strip_w
     cfg.strip[0].s3_owned_lo,  cfg.strip[0].s3_owned_hi = 0,                strip_w >> 1
+    cfg.strip[0].owned_y_lo,     cfg.strip[0].owned_y_hi    = 0, H2
+    cfg.strip[0].s3_owned_y_lo,  cfg.strip[0].s3_owned_y_hi = 0, H3
     cfg.strip[1].owned_lo,     cfg.strip[1].owned_hi    = strip_w,          W2
     cfg.strip[1].s3_owned_lo,  cfg.strip[1].s3_owned_hi = strip_w >> 1,     W3
+    cfg.strip[1].owned_y_lo,     cfg.strip[1].owned_y_hi    = 0, H2
+    cfg.strip[1].s3_owned_y_lo,  cfg.strip[1].s3_owned_y_hi = 0, H3
     for blk in range(N_BLOCKS):
         for li in range(4):
             cfg.layers[blk][li].qvgIn      = gpu_layers[blk][li]["qvgIn"]
@@ -382,6 +390,19 @@ class S01gAPI:
             ctypes.c_int, ctypes.c_int,
             ctypes.c_int, ctypes.c_int,
         ]
+        L.s01g_attach_gpu_rings_multi.restype = None
+        L.s01g_attach_gpu_rings_multi.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),    # ring_bufs[]
+            ctypes.POINTER(ctypes.c_void_p),    # ring_heads[]
+            ctypes.c_uint64,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),       # proc_x_los[]
+            ctypes.POINTER(ctypes.c_int),       # proc_x_his[]
+            ctypes.POINTER(ctypes.c_int),       # proc_y_los[]
+            ctypes.POINTER(ctypes.c_int),       # proc_y_his[]
+        ]
         L.s01g_submit_batch.restype = ctypes.c_int
         L.s01g_submit_batch.argtypes = [ctypes.c_void_p,
                                           ctypes.POINTER(ctypes.c_float),
@@ -421,6 +442,26 @@ class S01gAPI:
             ctypes.c_void_p(int(ring_head_1)),
             ring_mask, W2, H2,
             proc_lo_0, proc_hi_0, proc_lo_1, proc_hi_1)
+
+    def attach_multi(self, ring_bufs, ring_heads, ring_mask, W2, H2,
+                     proc_x_los, proc_x_his, proc_y_los, proc_y_his):
+        n = len(ring_bufs)
+        assert all(len(a) == n for a in
+                   (ring_heads, proc_x_los, proc_x_his, proc_y_los, proc_y_his))
+        BufArr   = ctypes.c_void_p * n
+        IntArr   = ctypes.c_int * n
+        bufs   = BufArr(*(ctypes.c_void_p(int(p)) for p in ring_bufs))
+        heads  = BufArr(*(ctypes.c_void_p(int(p)) for p in ring_heads))
+        xlos   = IntArr(*proc_x_los)
+        xhis   = IntArr(*proc_x_his)
+        ylos   = IntArr(*proc_y_los)
+        yhis   = IntArr(*proc_y_his)
+        # Keep arrays alive across the call.
+        self._attach_keepalive = (bufs, heads, xlos, xhis, ylos, yhis)
+        self.lib.s01g_attach_gpu_rings_multi(
+            self.handle, ctypes.c_int(n),
+            bufs, heads, ring_mask, W2, H2,
+            xlos, xhis, ylos, yhis)
 
     def submit(self, events_array: np.ndarray) -> int:
         n = events_array.shape[0]

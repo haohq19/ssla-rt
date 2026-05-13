@@ -42,6 +42,10 @@ struct HybridStrip {
     int owned_hi;       // (exclusive)
     int s3_owned_lo;    // s3-x range owned (= owned_lo >> 1, set by host)
     int s3_owned_hi;    // (= owned_hi >> 1)
+    int owned_y_lo;
+    int owned_y_hi;
+    int s3_owned_y_lo;
+    int s3_owned_y_hi;
 };
 
 // Per-event GPU timing slot. The persistent kernel records clock64() at
