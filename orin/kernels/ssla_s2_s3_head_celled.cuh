@@ -212,12 +212,16 @@ __device__ inline void process_patch_cell(
 }
 
 
-// ---- State-only variant: qvg + lru, NO goW / contrib write ----------------
+// ---- State-only variant: VG-ONLY matvec + lru, NO Q / goW / contrib write ----
 //
 // Used when caller knows the event will be tdrop-dropped before its layer
-// output is consumed. Hidden state MUST still evolve (recurrent invariant)
-// so we run qvg + lru. The goW matvec, qh smem stage, and contrib write are
-// all skipped — that's the savings.
+// output is consumed. Hidden state evolves through `gc * h + v` only —
+// Q is multiplied with h_new to produce qh, which is the input to goW.
+// Since goW is skipped (no output computed), qh is unused, and therefore
+// the Q matvec AND the q*h_new mul in lru_step are both pure waste.
+// This vg-only variant skips both. Saves ~1/3 of the per-iter inner work
+// (2 of 3 weight LDGs and 2 of 3 FMAs in the inner loop) plus the lru_step
+// `q[k] * hc` multiply. Identical hidden-state update as the qvg path.
 template <int IN, int OUT>
 __device__ inline void process_patch_cell_state_only(
     const float* __restrict__ in_feat_sm,
@@ -227,11 +231,10 @@ __device__ inline void process_patch_cell_state_only(
     constexpr int OUT_K = (OUT + 31) / 32;
     const int lane = threadIdx.x & 31;
 
-    // Merged qvg matvec: same as in process_patch_cell.
-    float q_local[OUT_K], v_local[OUT_K], g_local[OUT_K];
+    // V/G matvec only — skip the Q half of the weight tensor.
+    float v_local[OUT_K], g_local[OUT_K];
     #pragma unroll
     for (int k = 0; k < OUT_K; ++k) {
-        q_local[k] = 0.f;
         v_local[k] = 0.f;
         g_local[k] = 0.f;
     }
@@ -242,20 +245,24 @@ __device__ inline void process_patch_cell_state_only(
         for (int k = 0; k < OUT_K; ++k) {
             const int o = lane + 32 * k;
             if (o < OUT) {
-                const float wq = qvgIn[(long long)i * (3 * OUT) + 0 * OUT + o];
                 const float wv = qvgIn[(long long)i * (3 * OUT) + 1 * OUT + o];
                 const float wg = qvgIn[(long long)i * (3 * OUT) + 2 * OUT + o];
-                q_local[k] += wq * xi;
                 v_local[k] += wv * xi;
                 g_local[k] += wg * xi;
             }
         }
     }
 
-    // lru_step on owned cell. Result qh_local is discarded — no goW.
-    float qh_local[OUT_K];
-    lru_step_w<OUT>(g_local, v_local, q_local, h_cell, qh_local);
-    (void)qh_local;
+    // lru_step inline (vg-only): gc = sigmoid(g); h = gc * h + v.
+    // Skips qh = q * h_new since qh is unused in state-only path.
+    #pragma unroll
+    for (int k = 0; k < OUT_K; ++k) {
+        const int o = lane + 32 * k;
+        if (o < OUT) {
+            const float gc = sigmoidf_(g_local[k]);
+            h_cell[o] = gc * h_cell[o] + v_local[k];
+        }
+    }
 }
 
 
