@@ -58,35 +58,30 @@ struct GpuTimingSlot {
 };
 
 // Shared config readable by both blocks.
+// Must match MAX_BLOCKS in ssla_s2_s3_head_celled.cuh.
+constexpr int MAX_BLOCKS = 16;
+
 struct HybridS2S3Config {
-    int H2, W2;                 // s2 grid (post-CPU-stage-1 pool resolution)
-    int H3, W3;                 // s3 grid (post-stage-2 pool)
+    int H2, W2;
+    int H3, W3;
     int tdrop_window;
-    int head_out_dim;           // = 5 + N_classes (e.g. 7 for Gen1's 2 classes).
-                                // Runtime field is informational; the kernel
-                                // uses HEAD_OUT as a template constant.
-    HybridStrip      strip[2];
-    LayerWeightsS2S3 layers[2][4];     // [blockIdx.x][L4..L7]
-    float*           hidden[2][4];      // per-block, full-grid hidden state
-    unsigned char*   tdrop_s2[2];       // per-block (H2*W2 bytes)
-    unsigned char*   tdrop_s3[2];       // per-block (H3*W3 bytes)
-    // Head (shared across blocks; NULL = skip head matvec, used by the
-    // P1 oracle harness which compares s3 features directly).
-    const float*     head_W;            // (C3, HEAD_OUT) row-major
-    const float*     head_b;            // (HEAD_OUT,)
-    // Per-block predictions (pinned host alloc on Tegra). Layout for block b:
-    //   preds[b][hy * s3_owned_w + hx_local][HEAD_OUT]
-    // where s3_owned_w = strip[b].s3_owned_hi - strip[b].s3_owned_lo
-    //       hx_local  = s3x - strip[b].s3_owned_lo.
-    float*           preds[2];
-    unsigned int*    version[2];        // sized H3 * s3_owned_w per block
-    // GPU timing — NULL = disabled. timing_mask = capacity − 1.
-    GpuTimingSlot*   timing[2];
+    int head_out_dim;
+    int n_blocks;
+    int _pad_nblocks;
+    HybridStrip      strip[MAX_BLOCKS];
+    LayerWeightsS2S3 layers[MAX_BLOCKS][4];
+    float*           hidden[MAX_BLOCKS][4];
+    unsigned char*   tdrop_s2[MAX_BLOCKS];
+    unsigned char*   tdrop_s3[MAX_BLOCKS];
+    const float*     head_W;
+    const float*     head_b;
+    float*           preds[MAX_BLOCKS];
+    unsigned int*    version[MAX_BLOCKS];
+    GpuTimingSlot*   timing[MAX_BLOCKS];
     unsigned int     timing_mask;
     unsigned int     _pad_timing;
-    // Per-block calibration: see ssla_s2_s3_head_celled.cuh for details.
-    unsigned long long* kernel_start_clk[2];
-    unsigned long long* kernel_end_clk[2];
+    unsigned long long* kernel_start_clk[MAX_BLOCKS];
+    unsigned long long* kernel_end_clk[MAX_BLOCKS];
 };
 
 // Per-event input record (CPU pushes; GPU pops). 112 bytes.

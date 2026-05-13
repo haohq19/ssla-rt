@@ -65,30 +65,34 @@ struct GpuTimingSlot {
     unsigned long long t_push_ns;   // copied from HybridInputRec at process time
 };
 
+// Max GPU blocks the runtime supports. Bumped from 2 → 16 so each block can
+// be pinned to its own SM (Orin NX has 8 SMs; future devices may have more).
+// cfg.n_blocks is the runtime count; the kernel early-returns for
+// blockIdx.x >= n_blocks.
+constexpr int MAX_BLOCKS = 16;
+
 struct HybridS2S3Config {
     int H2, W2;
     int H3, W3;
     int tdrop_window;
     int head_out_dim;
-    HybridStrip      strip[2];
-    LayerWeightsS2S3 layers[2][4];
-    float*           hidden[2][4];
-    unsigned char*   tdrop_s2[2];
-    unsigned char*   tdrop_s3[2];
+    int n_blocks;          // runtime block count; ≤ MAX_BLOCKS
+    int _pad_nblocks;      // keep 8-byte alignment for the arrays below
+    HybridStrip      strip[MAX_BLOCKS];
+    LayerWeightsS2S3 layers[MAX_BLOCKS][4];
+    float*           hidden[MAX_BLOCKS][4];
+    unsigned char*   tdrop_s2[MAX_BLOCKS];
+    unsigned char*   tdrop_s3[MAX_BLOCKS];
     const float*     head_W;
     const float*     head_b;
-    float*           preds[2];
-    unsigned int*    version[2];
-    GpuTimingSlot*   timing[2];
+    float*           preds[MAX_BLOCKS];
+    unsigned int*    version[MAX_BLOCKS];
+    GpuTimingSlot*   timing[MAX_BLOCKS];
     unsigned int     timing_mask;
     unsigned int     _pad_timing;
-    // Per-block calibration slots. Kernel writes clock64() at entry into
-    // kernel_start_clk[blk] and at exit (stop-flag observed) into
-    // kernel_end_clk[blk]. The host records its CLOCK_MONOTONIC_RAW
-    // immediately around launch / sync to form two known
-    // (cpu_ns, sm_cycles) pairs; effective ns/cycle = slope between them.
-    unsigned long long* kernel_start_clk[2];
-    unsigned long long* kernel_end_clk[2];
+    // Per-block calibration: see comment in earlier revision.
+    unsigned long long* kernel_start_clk[MAX_BLOCKS];
+    unsigned long long* kernel_end_clk[MAX_BLOCKS];
 };
 
 struct HybridInputRec {
@@ -146,11 +150,32 @@ __device__ inline void process_patch_cell(
     constexpr int OUT_K = (OUT + 31) / 32;
     const int lane = threadIdx.x & 31;
 
-    // qvg matvec: 3 separate matvecs aliasing the same (IN, 3*OUT) layout
+    // Merged qvg matvec: 3 accumulators per output, share the x[i] LDS
+    // broadcast across q/v/g. Drops smem-LDS count 3× vs the 3-call form
+    // — microbench at L5/L7 shows 1.3-1.4× per-patch speedup.
     float q_local[OUT_K], v_local[OUT_K], g_local[OUT_K];
-    matvec_w<IN, OUT, 3 * OUT>(in_feat_sm, qvgIn + 0 * OUT, q_local);
-    matvec_w<IN, OUT, 3 * OUT>(in_feat_sm, qvgIn + 1 * OUT, v_local);
-    matvec_w<IN, OUT, 3 * OUT>(in_feat_sm, qvgIn + 2 * OUT, g_local);
+    #pragma unroll
+    for (int k = 0; k < OUT_K; ++k) {
+        q_local[k] = 0.f;
+        v_local[k] = 0.f;
+        g_local[k] = 0.f;
+    }
+    #pragma unroll
+    for (int i = 0; i < IN; ++i) {
+        const float xi = in_feat_sm[i];
+        #pragma unroll
+        for (int k = 0; k < OUT_K; ++k) {
+            const int o = lane + 32 * k;
+            if (o < OUT) {
+                const float wq = qvgIn[(long long)i * (3 * OUT) + 0 * OUT + o];
+                const float wv = qvgIn[(long long)i * (3 * OUT) + 1 * OUT + o];
+                const float wg = qvgIn[(long long)i * (3 * OUT) + 2 * OUT + o];
+                q_local[k] += wq * xi;
+                v_local[k] += wv * xi;
+                g_local[k] += wg * xi;
+            }
+        }
+    }
 
     // lru_step on owned cell — only this warp writes to h_cell, no race.
     float qh_local[OUT_K];
@@ -623,6 +648,147 @@ void k_ssla_s2s3_celled_drain_n(
                     out[batch_base + e].pass3 = p3;
                 }
                 // Always materialize s3_feat (oracle compares only owner-passed).
+                for (int i = threadIdx.x; i < C3; i += blockDim.x) {
+                    out[batch_base + e].s3_feat[i] = event_slots[e].in_feat[i];
+                }
+            }
+        }
+        if (threadIdx.x == 0 && batch_clk != 0) {
+            const unsigned long long t_done = clock64();
+            batch_clk[batch_idx * 2 + 0] = t_batch_pop_local;
+            batch_clk[batch_idx * 2 + 1] = t_done;
+        }
+        __syncthreads();
+    }
+}
+
+
+// ============================================================================
+// Multi-block drain kernel — N independent rings, one per block.
+//
+// Same per-batch flow as k_ssla_s2s3_celled_drain_n above, but the per-block
+// ring/output/clk pointers are read from device pointer arrays so we can
+// launch with grid=(cfg.n_blocks, 1, 1) and saturate every SM. This is the
+// throughput-experiment harness (not the P1 oracle) — caller is responsible
+// for splitting the event stream across N blocks and providing N hidden /
+// tdrop / weight pointers in cfg.
+// ============================================================================
+extern "C" __global__
+__launch_bounds__(N_WARPS * 32, 1)
+void k_ssla_s2s3_celled_drain_n_multi(
+    const HybridS2S3Config*       cfg_in,
+    const HybridInputRec* const*  rings,        // [n_blocks] device array
+    const int*                    ns,            // [n_blocks] event counts
+    HybridS2S3OutputSlot* const*  outs,          // [n_blocks] or NULL
+    unsigned long long* const*    batch_clks)    // [n_blocks] or NULL
+{
+    const HybridS2S3Config& cfg = *cfg_in;
+    if (blockIdx.x >= cfg.n_blocks) return;
+    extern __shared__ float smem_raw[];
+    const int blk = blockIdx.x;
+    const HybridInputRec*   ring     = rings[blk];
+    HybridS2S3OutputSlot*   out      = (outs != 0) ? outs[blk] : nullptr;
+    const int               n        = ns[blk];
+    unsigned long long*     batch_clk = (batch_clks != 0) ? batch_clks[blk] : nullptr;
+
+    char* smem = (char*)smem_raw;
+    EventSlot* event_slots = (EventSlot*)smem;
+    char* p = smem + sizeof(EventSlot) * BATCH;
+    float* contrib = (float*)p;
+    p += BATCH * N_WARPS * OUT_MAX * sizeof(float);
+    float* per_warp_in_feat_sm = (float*)p;
+    p += N_WARPS * OUT_MAX * sizeof(float);
+    float* per_warp_qh_sm = (float*)p;
+    p += N_WARPS * OUT_MAX * sizeof(float);
+    int* task_event = (int*)p;
+    p += N_WARPS * BATCH * sizeof(int);
+    int* task_delta = (int*)p;
+    p += N_WARPS * BATCH * sizeof(int);
+    int* task_count = (int*)p;
+    p += N_WARPS * sizeof(int);
+    int* pass2 = (int*)p;
+    p += BATCH * sizeof(int);
+    int* pass3 = (int*)p;
+    p += BATCH * sizeof(int);
+
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const HybridStrip& strip = cfg.strip[blk];
+
+    int batch_idx = 0;
+    for (int batch_base = 0; batch_base < n; batch_base += BATCH, ++batch_idx) {
+        const int batch_size = min(BATCH, n - batch_base);
+        unsigned long long t_batch_pop_local = 0;
+        if (threadIdx.x == 0 && batch_clk != 0) t_batch_pop_local = clock64();
+
+        for (int e = 0; e < batch_size; ++e) {
+            const HybridInputRec& rec = ring[batch_base + e];
+            for (int i = threadIdx.x; i < OUT_MAX; i += blockDim.x) {
+                event_slots[e].in_feat[i] = (i < C1) ? rec.feat1[i] : 0.0f;
+            }
+            if (threadIdx.x == 0) {
+                event_slots[e].evx = (int)rec.x;
+                event_slots[e].evy = (int)rec.y;
+                event_slots[e].is_owner =
+                    ((int)rec.x >= strip.owned_lo &&
+                     (int)rec.x <  strip.owned_hi) ? 1 : 0;
+                event_slots[e].pass2 = 0;
+                event_slots[e].pass3 = 0;
+                event_slots[e].t_push_ns = rec.t_push_ns;
+            }
+        }
+        __syncthreads();
+
+        dispatch_tasks(batch_size, cfg.H2, cfg.W2, event_slots, /*mask=*/0,
+                       task_event, task_delta, task_count);
+        __syncthreads();
+        run_layer_celled<C1, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, task_event, task_delta, task_count,
+                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled<C2, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, task_event, task_delta, task_count,
+                                  cfg.layers[blk][1], cfg.hidden[blk][1],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        serial_tdrop(batch_size, cfg.tdrop_window,
+                      cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
+                      pass2, /*is_s3=*/false);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            for (int e = 0; e < batch_size; ++e) {
+                event_slots[e].evx >>= 1;
+                event_slots[e].evy >>= 1;
+            }
+        }
+        __syncthreads();
+
+        dispatch_tasks(batch_size, cfg.H3, cfg.W3, event_slots, /*mask=*/pass2,
+                       task_event, task_delta, task_count);
+        __syncthreads();
+        run_layer_celled<C2, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, task_event, task_delta, task_count,
+                                  cfg.layers[blk][2], cfg.hidden[blk][2],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled<C3, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, task_event, task_delta, task_count,
+                                  cfg.layers[blk][3], cfg.hidden[blk][3],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        serial_tdrop(batch_size, cfg.tdrop_window,
+                      cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
+                      pass3, /*is_s3=*/true);
+        __syncthreads();
+
+        if (out != 0) {
+            for (int e = 0; e < batch_size; ++e) {
+                if (threadIdx.x == 0) {
+                    int p2 = event_slots[e].is_owner ? pass2[e] : -1;
+                    int p3 = event_slots[e].is_owner
+                                ? (pass2[e] ? pass3[e] : 0)
+                                : -1;
+                    out[batch_base + e].pass2 = p2;
+                    out[batch_base + e].pass3 = p3;
+                }
                 for (int i = threadIdx.x; i < C3; i += blockDim.x) {
                     out[batch_base + e].s3_feat[i] = event_slots[e].in_feat[i];
                 }

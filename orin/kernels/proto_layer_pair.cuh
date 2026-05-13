@@ -56,7 +56,9 @@ __device__ inline void matvec_w(
             y[k] = acc;
         }
     }
-    __syncwarp();
+    // No __syncwarp: output is lane-private registers. Caller adds explicit
+    // sync only if a downstream cross-lane read is needed (e.g., before a
+    // broadcast-LDS of the result through smem).
 }
 
 // ---------------------------------------------------------------
@@ -87,7 +89,8 @@ __device__ inline void lru_step_w(
             qh[k] = q[k] * hc;
         }
     }
-    __syncwarp();
+    // No __syncwarp: h_cell is per-cell owned by this warp (cell-owner
+    // invariant), no cross-lane dep on qh. Caller syncs if needed.
 }
 
 // ---------------------------------------------------------------

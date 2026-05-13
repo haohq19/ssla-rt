@@ -57,26 +57,30 @@ struct GpuTimingSlot {
     unsigned long long t_push_ns;   // copied from HybridInputRec at process time
 };
 
+// Must match MAX_BLOCKS in ssla_s2_s3_head_celled.cuh.
+constexpr int MAX_BLOCKS = 16;
+
 struct HybridS2S3Config {
     int H2, W2;
     int H3, W3;
     int tdrop_window;
     int head_out_dim;
-    HybridStrip      strip[2];
-    LayerWeightsS2S3 layers[2][4];
-    float*           hidden[2][4];
-    unsigned char*   tdrop_s2[2];
-    unsigned char*   tdrop_s3[2];
+    int n_blocks;
+    int _pad_nblocks;
+    HybridStrip      strip[MAX_BLOCKS];
+    LayerWeightsS2S3 layers[MAX_BLOCKS][4];
+    float*           hidden[MAX_BLOCKS][4];
+    unsigned char*   tdrop_s2[MAX_BLOCKS];
+    unsigned char*   tdrop_s3[MAX_BLOCKS];
     const float*     head_W;
     const float*     head_b;
-    float*           preds[2];
-    unsigned int*    version[2];
-    GpuTimingSlot*   timing[2];
+    float*           preds[MAX_BLOCKS];
+    unsigned int*    version[MAX_BLOCKS];
+    GpuTimingSlot*   timing[MAX_BLOCKS];
     unsigned int     timing_mask;
     unsigned int     _pad_timing;
-    // Per-block calibration: see ssla_s2_s3_head_celled.cuh for details.
-    unsigned long long* kernel_start_clk[2];
-    unsigned long long* kernel_end_clk[2];
+    unsigned long long* kernel_start_clk[MAX_BLOCKS];
+    unsigned long long* kernel_end_clk[MAX_BLOCKS];
 };
 
 struct HybridInputRec {

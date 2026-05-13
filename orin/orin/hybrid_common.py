@@ -65,30 +65,31 @@ class CLayerWeightsS2S3(ctypes.Structure):
     ]
 
 
+MAX_BLOCKS = 16   # match constexpr in ssla_s2_s3_head*.cuh
+
+
 class CHybridS2S3Config(ctypes.Structure):
     _fields_ = [
         ("H2", ctypes.c_int32), ("W2", ctypes.c_int32),
         ("H3", ctypes.c_int32), ("W3", ctypes.c_int32),
         ("tdrop_window", ctypes.c_int32),
         ("head_out_dim", ctypes.c_int32),
-        ("strip",     CHybridStrip * 2),
-        ("layers",    (CLayerWeightsS2S3 * 4) * 2),
-        ("hidden",    (ctypes.c_uint64 * 4) * 2),
-        ("tdrop_s2",  ctypes.c_uint64 * 2),
-        ("tdrop_s3",  ctypes.c_uint64 * 2),
+        ("n_blocks",     ctypes.c_int32),
+        ("_pad_nblocks", ctypes.c_int32),
+        ("strip",     CHybridStrip * MAX_BLOCKS),
+        ("layers",    (CLayerWeightsS2S3 * 4) * MAX_BLOCKS),
+        ("hidden",    (ctypes.c_uint64 * 4) * MAX_BLOCKS),
+        ("tdrop_s2",  ctypes.c_uint64 * MAX_BLOCKS),
+        ("tdrop_s3",  ctypes.c_uint64 * MAX_BLOCKS),
         ("head_W",    ctypes.c_uint64),
         ("head_b",    ctypes.c_uint64),
-        ("preds",     ctypes.c_uint64 * 2),
-        ("version",   ctypes.c_uint64 * 2),
-        ("timing",       ctypes.c_uint64 * 2),
+        ("preds",     ctypes.c_uint64 * MAX_BLOCKS),
+        ("version",   ctypes.c_uint64 * MAX_BLOCKS),
+        ("timing",       ctypes.c_uint64 * MAX_BLOCKS),
         ("timing_mask",  ctypes.c_uint32),
-        ("_pad_timing",  ctypes.c_uint32),  # explicit, keep struct 8-byte aligned
-        # Per-block calibration: kernel writes clock64() at entry into
-        # *kernel_start_clk[blk] and at exit (stop-flag observed) into
-        # *kernel_end_clk[blk]. The host pairs each with its
-        # CLOCK_MONOTONIC_RAW reading at the corresponding moment.
-        ("kernel_start_clk", ctypes.c_uint64 * 2),
-        ("kernel_end_clk",   ctypes.c_uint64 * 2),
+        ("_pad_timing",  ctypes.c_uint32),
+        ("kernel_start_clk", ctypes.c_uint64 * MAX_BLOCKS),
+        ("kernel_end_clk",   ctypes.c_uint64 * MAX_BLOCKS),
     ]
 
 
@@ -213,6 +214,7 @@ def build_config(H2: int, W2: int, H3: int, W3: int, tdrop_window: int,
     cfg.H3, cfg.W3 = H3, W3
     cfg.tdrop_window = tdrop_window
     cfg.head_out_dim = head_out_dim
+    cfg.n_blocks = N_BLOCKS    # existing 2-block default
     strip_w = W2 // N_BLOCKS
     cfg.strip[0].owned_lo,     cfg.strip[0].owned_hi    = 0,                strip_w
     cfg.strip[0].s3_owned_lo,  cfg.strip[0].s3_owned_hi = 0,                strip_w >> 1
