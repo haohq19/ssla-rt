@@ -854,6 +854,22 @@ void k_ssla_s2s3_celled_drain_n(
     p += BATCH * sizeof(int);
     int* pass3 = (int*)p;
     p += BATCH * sizeof(int);
+    // L4 qvgIn smem cache (9 * 3*C2 * C1 floats = 121 KB): loaded once at
+    // kernel entry, reused across all batches. Eliminates the per-batch
+    // DRAM/L2 reload of L4 weights — see project_occupancy_gives_little.md
+    // analysis pointing at L2 thrash as the suspected bottleneck.
+    float* qvg_l4_sm = (float*)p;
+    p += 9 * 3 * C2 * C1 * sizeof(float);
+    {
+        const float* qvg_l4_g = cfg.layers[blk][0].qvgIn;
+        constexpr int L4_QVG_TOTAL = 9 * 3 * C2 * C1;
+        for (int i = threadIdx.x; i < L4_QVG_TOTAL; i += blockDim.x) {
+            qvg_l4_sm[i] = qvg_l4_g[i];
+        }
+    }
+    __syncthreads();
+    LayerWeightsS2S3 L4_layer_smem = cfg.layers[blk][0];
+    L4_layer_smem.qvgIn = qvg_l4_sm;
 
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
@@ -905,7 +921,7 @@ void k_ssla_s2s3_celled_drain_n(
         // L4: full work for all events — output feeds L5 hidden state.
         run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  L4_layer_smem,      cfg.hidden[blk][0],
                                   contrib, per_warp_in_feat_sm, per_warp_qh_sm);
         // L5: qvg+lru for all events (hidden state must evolve), but skip
         // goW+gather+LN for events that will be tdrop-dropped (output unused).
@@ -1021,6 +1037,22 @@ void k_ssla_s2s3_celled_drain_n_multi(
     p += BATCH * sizeof(int);
     int* pass3 = (int*)p;
     p += BATCH * sizeof(int);
+    // L4 qvgIn smem cache (9 * 3*C2 * C1 floats = 121 KB): loaded once at
+    // kernel entry, reused across all batches. Eliminates the per-batch
+    // DRAM/L2 reload of L4 weights — see project_occupancy_gives_little.md
+    // analysis pointing at L2 thrash as the suspected bottleneck.
+    float* qvg_l4_sm = (float*)p;
+    p += 9 * 3 * C2 * C1 * sizeof(float);
+    {
+        const float* qvg_l4_g = cfg.layers[blk][0].qvgIn;
+        constexpr int L4_QVG_TOTAL = 9 * 3 * C2 * C1;
+        for (int i = threadIdx.x; i < L4_QVG_TOTAL; i += blockDim.x) {
+            qvg_l4_sm[i] = qvg_l4_g[i];
+        }
+    }
+    __syncthreads();
+    LayerWeightsS2S3 L4_layer_smem = cfg.layers[blk][0];
+    L4_layer_smem.qvgIn = qvg_l4_sm;
 
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
@@ -1062,7 +1094,7 @@ void k_ssla_s2s3_celled_drain_n_multi(
         // Stage 2.
         run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  L4_layer_smem,      cfg.hidden[blk][0],
                                   contrib, per_warp_in_feat_sm, per_warp_qh_sm);
         run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*enter=*/0, /*output=*/pass2,
@@ -1178,6 +1210,22 @@ void k_ssla_s2s3_celled_persistent(
     p += BATCH * sizeof(int);
     int* pass3 = (int*)p;
     p += BATCH * sizeof(int);
+    // L4 qvgIn smem cache (9 * 3*C2 * C1 floats = 121 KB): loaded once at
+    // kernel entry, reused across all batches. Eliminates the per-batch
+    // DRAM/L2 reload of L4 weights — see project_occupancy_gives_little.md
+    // analysis pointing at L2 thrash as the suspected bottleneck.
+    float* qvg_l4_sm = (float*)p;
+    p += 9 * 3 * C2 * C1 * sizeof(float);
+    {
+        const float* qvg_l4_g = cfg.layers[blk][0].qvgIn;
+        constexpr int L4_QVG_TOTAL = 9 * 3 * C2 * C1;
+        for (int i = threadIdx.x; i < L4_QVG_TOTAL; i += blockDim.x) {
+            qvg_l4_sm[i] = qvg_l4_g[i];
+        }
+    }
+    __syncthreads();
+    LayerWeightsS2S3 L4_layer_smem = cfg.layers[blk][0];
+    L4_layer_smem.qvgIn = qvg_l4_sm;
 
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
@@ -1270,7 +1318,7 @@ void k_ssla_s2s3_celled_persistent(
         // ---- Stage 2 ----
         run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  L4_layer_smem,      cfg.hidden[blk][0],
                                   contrib, per_warp_in_feat_sm, per_warp_qh_sm);
         run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*enter=*/0, /*output=*/pass2,
@@ -1424,6 +1472,22 @@ void k_ssla_s2s3_celled_persistent_multi(
     p += BATCH * sizeof(int);
     int* pass3 = (int*)p;
     p += BATCH * sizeof(int);
+    // L4 qvgIn smem cache (9 * 3*C2 * C1 floats = 121 KB): loaded once at
+    // kernel entry, reused across all batches. Eliminates the per-batch
+    // DRAM/L2 reload of L4 weights — see project_occupancy_gives_little.md
+    // analysis pointing at L2 thrash as the suspected bottleneck.
+    float* qvg_l4_sm = (float*)p;
+    p += 9 * 3 * C2 * C1 * sizeof(float);
+    {
+        const float* qvg_l4_g = cfg.layers[blk][0].qvgIn;
+        constexpr int L4_QVG_TOTAL = 9 * 3 * C2 * C1;
+        for (int i = threadIdx.x; i < L4_QVG_TOTAL; i += blockDim.x) {
+            qvg_l4_sm[i] = qvg_l4_g[i];
+        }
+    }
+    __syncthreads();
+    LayerWeightsS2S3 L4_layer_smem = cfg.layers[blk][0];
+    L4_layer_smem.qvgIn = qvg_l4_sm;
     (void)task_event; (void)task_delta; (void)task_count;
 
     const int warp_id = threadIdx.x >> 5;
@@ -1504,7 +1568,7 @@ void k_ssla_s2s3_celled_persistent_multi(
 
         run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  L4_layer_smem,      cfg.hidden[blk][0],
                                   contrib, per_warp_in_feat_sm, per_warp_qh_sm);
         run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
                                   event_slots, /*enter=*/0, /*output=*/pass2,

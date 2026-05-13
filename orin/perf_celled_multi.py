@@ -39,6 +39,7 @@ KERNELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernels"
 
 
 def _smem_size_bytes() -> int:
+    C1, C2 = 24, 48
     event_slot = OUT_MAX * 4 + OUT_MAX * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
     smem = (
         event_slot * BATCH
@@ -50,6 +51,7 @@ def _smem_size_bytes() -> int:
         + N_WARPS * 4
         + BATCH * 4
         + BATCH * 4
+        + 9 * 3 * C2 * C1 * 4   # L4 qvgIn smem cache (121 KB)
     )
     return ((smem + 15) // 16) * 16
 
@@ -233,6 +235,15 @@ def main() -> int:
     func = mod.get_function("k_ssla_s2s3_celled_drain_n_multi")
     threads_per_block = N_WARPS * 32
     SMEM = _smem_size_bytes()
+
+    # Opt-in to dynamic smem >48 KB (sm_87 supports up to ~167 KB / block).
+    from cuda import cuda as _cuda
+    _err, = _cuda.cuFuncSetAttribute(
+        func._func,
+        _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        SMEM)
+    if int(_err) != 0:
+        raise RuntimeError(f"cuFuncSetAttribute(MAX_DYNAMIC_SHARED): err={int(_err)}, smem={SMEM}")
 
     print(f"\nGPU drain (multi): {n_blocks} blocks × {threads_per_block} threads, "
           f"smem={SMEM} B (n/block={n_per_block})\n")

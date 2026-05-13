@@ -349,6 +349,7 @@ def main() -> int:
         BATCH_K = 8
         N_WARPS_K = 9
         OUT_MAX_K = C3
+        C1_K, C2_K = 24, 48
         event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
         SMEM = (event_slot * BATCH_K
                 + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
@@ -358,13 +359,23 @@ def main() -> int:
                 + N_WARPS_K * BATCH_K * 4
                 + N_WARPS_K * 4
                 + BATCH_K * 4
-                + BATCH_K * 4)
+                + BATCH_K * 4
+                + 9 * 3 * C2_K * C1_K * 4)   # L4 qvgIn smem cache (121 KB)
         SMEM = ((SMEM + 15) // 16) * 16
     print(f"Compiling {args.kernel_variant} kernel ...", flush=True)
     t0 = time.monotonic()
     mod = CudaModule(src, name=mod_name, headers=headers)
     print(f"  cache {mod.cache_status} in {time.monotonic()-t0:.1f}s", flush=True)
     func = mod.get_function(func_name)
+    # Opt-in to dynamic smem >48 KB (sm_87 supports up to ~167 KB / block).
+    if SMEM > 48 * 1024:
+        from cuda import cuda as _cuda
+        _err, = _cuda.cuFuncSetAttribute(
+            func._func,
+            _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            SMEM)
+        if int(_err) != 0:
+            raise RuntimeError(f"cuFuncSetAttribute(MAX_DYNAMIC_SHARED): err={int(_err)}, smem={SMEM}")
     print(f"Launching persistent kernel: gridDim=2, blockDim={threads_pb}, "
           f"smem={SMEM} B", flush=True)
     # CPU/GPU clock-anchor for end-to-end latency. We record CPU monotonic

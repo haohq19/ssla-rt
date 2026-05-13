@@ -147,6 +147,7 @@ def main():
     func = mod.get_function("k_ssla_s2s3_celled_persistent_multi")
     threads_pb = 9 * 32
     BATCH_K, N_WARPS_K, OUT_MAX_K = 8, 9, C3
+    C1_K, C2_K = 24, 48
     event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8 + 8
     SMEM = (event_slot * BATCH_K
             + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
@@ -156,8 +157,18 @@ def main():
             + N_WARPS_K * BATCH_K * 4
             + N_WARPS_K * 4
             + BATCH_K * 4
-            + BATCH_K * 4)
+            + BATCH_K * 4
+            + 9 * 3 * C2_K * C1_K * 4)   # L4 qvgIn smem cache (121 KB)
     SMEM = ((SMEM + 15) // 16) * 16
+
+    # Opt-in to dynamic smem >48 KB (sm_87 supports up to ~167 KB / block).
+    from cuda import cuda as _cuda
+    _err, = _cuda.cuFuncSetAttribute(
+        func._func,
+        _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        SMEM)
+    if int(_err) != 0:
+        raise RuntimeError(f"cuFuncSetAttribute(MAX_DYNAMIC_SHARED): err={int(_err)}, smem={SMEM}")
 
     # Pointer arrays for kernel: rings[], tails[], events_dones[].
     def _alloc_ptr_array(values):
@@ -298,21 +309,32 @@ def main():
         emit_to_push = (t_push - t_emit) / 1000.0
         push_to_done = (t_done_ns_cpu - t_push) / 1000.0
         emit_to_done = (t_done_ns_cpu - t_emit) / 1000.0
+        # GPU-internal kernel time t_pop_clk → t_done_clk (same SM clock,
+        # no cross-clock bias). Use the per-block ns_per_cycle which is
+        # what we just derived from the two-anchor calibration.
+        kernel_us = ((tv["t_done_clk"][idx].astype(np.int64) -
+                      tv["t_pop_clk"][idx].astype(np.int64))
+                     * ns_per_cycle / 1000.0)
 
         owner_mask = tv["owner"][idx] == 1
         def _pct3(arr, mask):
             sub = arr[mask] if mask.any() else arr
             if sub.size == 0:
                 return "n/a", "n/a", "n/a"
-            return (f"{float(np.percentile(sub,50)):>4.0f}",
-                    f"{float(np.percentile(sub,99)):>4.0f}",
-                    f"{float(sub.max()):>4.0f}")
+            return (f"{float(np.percentile(sub,50)):>5.0f}",
+                    f"{float(np.percentile(sub,99)):>5.0f}",
+                    f"{float(sub.max()):>5.0f}")
         a50, a99, amx = _pct3(emit_to_push, owner_mask)
-        b50, b99, bmx = _pct3(push_to_done, owner_mask)
-        c50, c99, cmx = _pct3(emit_to_done, owner_mask)
+        k50, k99, kmx = _pct3(kernel_us, owner_mask)
         n_owner = int(owner_mask.sum())
+        # CLEAN latency components (no cross-clock bias):
+        #   emit→push : same CPU clock domain (CLOCK_MONOTONIC_RAW)
+        #   kernel    : same GPU SM clock domain (t_done_clk − t_pop_clk)
+        # Sum ≈ whole-pipeline lower bound (omits push→pop ring-wait,
+        # which is ~few µs at low load).
         print(f"{b:>3} | {n_owner:>7d} | "
-              f"{a50}/{a99}/{amx} {b50}/{b99}/{bmx} {c50}/{c99}/{cmx}")
+              f"emit→push {a50}/{a99}/{amx}  "
+              f"kernel {k50}/{k99}/{kmx}")
 
 
 if __name__ == "__main__":

@@ -89,6 +89,7 @@ def cpu_oracle(events_x, events_y, events_feat1, cpu_layers, tdrop_window: int):
 def _smem_size_bytes():
     """Compute total dynamic SMEM the kernel needs, matching the kernel's
     pointer-bump allocation."""
+    C1, C2 = 24, 48
     # EventSlot = float[96] + float[96] + 5 ints (no padding assumed)
     event_slot = OUT_MAX * 4 + OUT_MAX * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
     smem = (
@@ -100,7 +101,8 @@ def _smem_size_bytes():
         N_WARPS * BATCH * 4 +                         # task_delta
         N_WARPS * 4 +                                 # task_count
         BATCH * 4 +                                   # pass2
-        BATCH * 4                                     # pass3
+        BATCH * 4 +                                   # pass3
+        9 * 3 * C2 * C1 * 4                            # L4 qvgIn smem cache (121 KB)
     )
     # Round up to 16 to leave a tiny safety margin.
     return ((smem + 15) // 16) * 16
@@ -201,6 +203,15 @@ def main() -> int:
     func = mod.get_function("k_ssla_s2s3_celled_drain_n")
     threads_per_block = N_WARPS * 32
     SMEM = _smem_size_bytes()
+
+    # Opt-in to dynamic smem >48 KB (sm_87 supports up to ~167 KB / block).
+    from cuda import cuda as _cuda
+    _err, = _cuda.cuFuncSetAttribute(
+        func._func,
+        _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        SMEM)
+    if int(_err) != 0:
+        raise RuntimeError(f"cuFuncSetAttribute(MAX_DYNAMIC_SHARED): err={int(_err)}, smem={SMEM}")
 
     # Per-batch timing buffers: 2 u64 (t_pop, t_done) per batch.
     n_batches = [((rec_block[b].size + BATCH - 1) // BATCH) for b in range(N_BLOCKS)]
