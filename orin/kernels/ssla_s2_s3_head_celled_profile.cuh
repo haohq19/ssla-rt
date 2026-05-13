@@ -49,16 +49,15 @@ constexpr int N_PHASES           = 24;
 } while (0)
 
 
-// Re-expanded run_layer with phase stamps. Same body as run_layer_celled
-// but with STAMP(...) between phases. RES/ZERO/COMPUTE/GATHER -> 4 stamps.
+// Re-expanded run_layer with phase stamps. Mirrors run_layer_celled_implicit
+// (current production path: no explicit dispatch_tasks, each warp derives
+// its per-event delta from cell-owner math).
 template <int IN, int OUT>
 __device__ inline void run_layer_celled_profiled(
     int batch_size,
     int Hl, int Wl,
     EventSlot*               event_slots,
-    const int*               task_event,
-    const int*               task_delta,
-    const int*               task_count,
+    const int*               mask,                   // [BATCH] or NULL
     const LayerWeightsS2S3&  layer,
     float*                   hidden,
     float*                   contrib,
@@ -70,6 +69,8 @@ __device__ inline void run_layer_celled_profiled(
 {
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
+    const int own_y   = warp_id / 3;
+    const int own_x   = warp_id % 3;
 
     // RESIDUAL
     if (warp_id < batch_size) {
@@ -86,31 +87,32 @@ __device__ inline void run_layer_celled_profiled(
     }
     STAMP(ph_zero);
 
-    // COMPUTE
+    // COMPUTE (implicit dispatch)
     float* my_in_feat_sm = per_warp_in_feat_sm + warp_id * IN;
     float* my_qh_sm      = per_warp_qh_sm + warp_id * OUT;
-    const int* my_tasks_event = task_event + warp_id * BATCH;
-    const int* my_tasks_delta = task_delta + warp_id * BATCH;
-    const int  n_tasks        = task_count[warp_id];
 
-    for (int t = 0; t < n_tasks; ++t) {
-        const int e     = my_tasks_event[t];
-        const int delta = my_tasks_delta[t];
+    for (int e = 0; e < batch_size; ++e) {
+        if (mask != 0 && mask[e] == 0) continue;
+        const int evx = event_slots[e].evx;
+        const int evy = event_slots[e].evy;
+        const int dy  = ((own_y - evy) % 3 + 3) % 3 - 1;
+        const int dx  = ((own_x - evx) % 3 + 3) % 3 - 1;
+        const int py  = evy + dy;
+        const int px  = evx + dx;
+        if (py < 0 || py >= Hl || px < 0 || px >= Wl) continue;
+        const int delta     = (1 - dy) * 3 + (1 - dx);
+        const int patch_idx = py * Wl + px;
+
         for (int i = lane; i < IN; i += 32) {
             my_in_feat_sm[i] = event_slots[e].in_feat[i];
         }
         __syncwarp();
-        const int dy = 1 - (delta / 3);
-        const int dx = 1 - (delta % 3);
-        const int py = event_slots[e].evy + dy;
-        const int px = event_slots[e].evx + dx;
-        if (py < 0 || py >= Hl || px < 0 || px >= Wl) continue;
-        const int patch_idx = py * Wl + px;
-        float* contrib_slot = contrib + ((long long)e * N_WARPS + warp_id) * OUT;
+
         constexpr int QVG_STRIDE = 3 * OUT * IN;
         constexpr int GOW_STRIDE = OUT * OUT;
         const float* qvg_w = layer.qvgIn + (long long)delta * QVG_STRIDE;
         const float* go_w  = layer.goW   + (long long)delta * GOW_STRIDE;
+        float* contrib_slot = contrib + ((long long)e * N_WARPS + warp_id) * OUT;
         process_patch_cell<IN, OUT>(
             my_in_feat_sm, qvg_w, go_w,
             hidden + (long long)patch_idx * OUT,
@@ -199,27 +201,25 @@ void k_ssla_s2s3_celled_drain_n_profile(
         }
         STAMP(PH_LOAD);
 
-        // STAGE 2
-        dispatch_tasks(batch_size, cfg.H2, cfg.W2, event_slots, 0,
-                       task_event, task_delta, task_count);
-        STAMP(PH_DISPATCH_S2);
+        // STAGE 2 (implicit dispatch + parallel tdrop)
+        STAMP(PH_DISPATCH_S2);   // no-op now, but kept for phase-index parity
         run_layer_celled_profiled<C1, C2>(
             batch_size, cfg.H2, cfg.W2,
-            event_slots, task_event, task_delta, task_count,
+            event_slots, /*mask=*/0,
             cfg.layers[blk][0], cfg.hidden[blk][0],
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L4_RES, PH_L4_ZERO, PH_L4_COMPUTE, PH_L4_GATHER);
         run_layer_celled_profiled<C2, C2>(
             batch_size, cfg.H2, cfg.W2,
-            event_slots, task_event, task_delta, task_count,
+            event_slots, /*mask=*/0,
             cfg.layers[blk][1], cfg.hidden[blk][1],
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L5_RES, PH_L5_ZERO, PH_L5_COMPUTE, PH_L5_GATHER);
-        serial_tdrop(batch_size, cfg.tdrop_window,
-                     cfg.tdrop_s2[blk], event_slots, cfg.W2, 0,
-                     pass2, false);
+        parallel_tdrop(batch_size, cfg.tdrop_window,
+                       cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
+                       pass2);
         STAMP(PH_TDROP_S2);
 
         if (threadIdx.x == 0) {
@@ -230,27 +230,25 @@ void k_ssla_s2s3_celled_drain_n_profile(
         }
         STAMP(PH_POOL);
 
-        // STAGE 3
-        dispatch_tasks(batch_size, cfg.H3, cfg.W3, event_slots, pass2,
-                       task_event, task_delta, task_count);
-        STAMP(PH_DISPATCH_S3);
+        // STAGE 3 (implicit dispatch + parallel tdrop)
+        STAMP(PH_DISPATCH_S3);   // no-op now
         run_layer_celled_profiled<C2, C3>(
             batch_size, cfg.H3, cfg.W3,
-            event_slots, task_event, task_delta, task_count,
+            event_slots, /*mask=*/pass2,
             cfg.layers[blk][2], cfg.hidden[blk][2],
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L6_RES, PH_L6_ZERO, PH_L6_COMPUTE, PH_L6_GATHER);
         run_layer_celled_profiled<C3, C3>(
             batch_size, cfg.H3, cfg.W3,
-            event_slots, task_event, task_delta, task_count,
+            event_slots, /*mask=*/pass2,
             cfg.layers[blk][3], cfg.hidden[blk][3],
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L7_RES, PH_L7_ZERO, PH_L7_COMPUTE, PH_L7_GATHER);
-        serial_tdrop(batch_size, cfg.tdrop_window,
-                     cfg.tdrop_s3[blk], event_slots, cfg.W3, pass2,
-                     pass3, true);
+        parallel_tdrop(batch_size, cfg.tdrop_window,
+                       cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
+                       pass3);
         STAMP(PH_TDROP_S3);
 
         if (out != 0) {

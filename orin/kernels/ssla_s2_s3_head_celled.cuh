@@ -204,6 +204,53 @@ __device__ inline void process_patch_cell(
 }
 
 
+// ---- State-only variant: qvg + lru, NO goW / contrib write ----------------
+//
+// Used when caller knows the event will be tdrop-dropped before its layer
+// output is consumed. Hidden state MUST still evolve (recurrent invariant)
+// so we run qvg + lru. The goW matvec, qh smem stage, and contrib write are
+// all skipped — that's the savings.
+template <int IN, int OUT>
+__device__ inline void process_patch_cell_state_only(
+    const float* __restrict__ in_feat_sm,
+    const float* __restrict__ qvgIn,    // (IN, 3*OUT) for this delta
+    float*       __restrict__ h_cell)
+{
+    constexpr int OUT_K = (OUT + 31) / 32;
+    const int lane = threadIdx.x & 31;
+
+    // Merged qvg matvec: same as in process_patch_cell.
+    float q_local[OUT_K], v_local[OUT_K], g_local[OUT_K];
+    #pragma unroll
+    for (int k = 0; k < OUT_K; ++k) {
+        q_local[k] = 0.f;
+        v_local[k] = 0.f;
+        g_local[k] = 0.f;
+    }
+    #pragma unroll
+    for (int i = 0; i < IN; ++i) {
+        const float xi = in_feat_sm[i];
+        #pragma unroll
+        for (int k = 0; k < OUT_K; ++k) {
+            const int o = lane + 32 * k;
+            if (o < OUT) {
+                const float wq = qvgIn[(long long)i * (3 * OUT) + 0 * OUT + o];
+                const float wv = qvgIn[(long long)i * (3 * OUT) + 1 * OUT + o];
+                const float wg = qvgIn[(long long)i * (3 * OUT) + 2 * OUT + o];
+                q_local[k] += wq * xi;
+                v_local[k] += wv * xi;
+                g_local[k] += wg * xi;
+            }
+        }
+    }
+
+    // lru_step on owned cell. Result qh_local is discarded — no goW.
+    float qh_local[OUT_K];
+    lru_step_w<OUT>(g_local, v_local, q_local, h_cell, qh_local);
+    (void)qh_local;
+}
+
+
 // ---- Helpers for gather + LN ---------------------------------------------
 
 // Per-event gather: sum contrib[event][0..8][:] + residual, then LN.
@@ -503,6 +550,122 @@ __device__ inline void run_layer_celled_implicit(
 }
 
 
+// ---- Split-mask implicit-dispatch layer ----------------------------------
+//
+// Two-mask variant of run_layer_celled_implicit. Events flow through three
+// states per layer:
+//   enter_mask[e] == 0  → skip the event entirely (no qvg, no lru, no goW)
+//   enter_mask[e] == 1 && output_mask[e] == 0
+//                       → run qvg + lru only (hidden state evolves) but
+//                         SKIP goW + gather + LN (output not consumed)
+//   enter_mask[e] == 1 && output_mask[e] == 1
+//                       → full processing (state + output)
+//
+// Used to skip ~75% of L5/L7 output computation for events that will be
+// dropped by the upcoming tdrop.
+//
+// enter_mask == NULL means "all events enter".
+// output_mask == NULL means "all entering events produce output".
+// (output_mask=NULL is the same as run_layer_celled_implicit.)
+template <int IN, int OUT>
+__device__ inline void run_layer_celled_implicit_split(
+    int batch_size,
+    int Hl, int Wl,
+    EventSlot*               event_slots,
+    const int*               enter_mask,             // [BATCH] or NULL
+    const int*               output_mask,            // [BATCH] or NULL
+    const LayerWeightsS2S3&  layer,
+    float*                   hidden,
+    float*                   contrib,
+    float*                   per_warp_in_feat_sm,
+    float*                   per_warp_qh_sm)
+{
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int own_y   = warp_id / 3;
+    const int own_x   = warp_id % 3;
+
+    // RESIDUAL: only for events that will produce output.
+    if (warp_id < batch_size) {
+        const int e = warp_id;
+        const bool entered = (enter_mask  == 0) || (enter_mask[e]  != 0);
+        const bool outputs = (output_mask == 0) || (output_mask[e] != 0);
+        if (entered && outputs) {
+            compute_residual<IN, OUT>(event_slots[e].in_feat, layer.input_proj,
+                                      event_slots[e].residual);
+        }
+    }
+    __syncthreads();
+
+    // Zero contrib. Only slots that will be GATHERed need to be 0, but we
+    // zero everything for simplicity — it's already a parallel sweep.
+    const int n_contrib_floats = batch_size * N_WARPS * OUT;
+    for (int i = threadIdx.x; i < n_contrib_floats; i += blockDim.x) {
+        contrib[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // COMPUTE: each warp visits all events in order. For each entered event,
+    // run qvg + lru (always needed for recurrent state). Then conditionally
+    // do goW + contrib write only if output_mask says so.
+    float* my_in_feat_sm = per_warp_in_feat_sm + warp_id * IN;
+    float* my_qh_sm      = per_warp_qh_sm + warp_id * OUT;
+
+    for (int e = 0; e < batch_size; ++e) {
+        if (enter_mask != 0 && enter_mask[e] == 0) continue;
+        const int evx = event_slots[e].evx;
+        const int evy = event_slots[e].evy;
+        const int dy  = ((own_y - evy) % 3 + 3) % 3 - 1;
+        const int dx  = ((own_x - evx) % 3 + 3) % 3 - 1;
+        const int py  = evy + dy;
+        const int px  = evx + dx;
+        if (py < 0 || py >= Hl || px < 0 || px >= Wl) continue;
+        const int delta     = (1 - dy) * 3 + (1 - dx);
+        const int patch_idx = py * Wl + px;
+
+        for (int i = lane; i < IN; i += 32) {
+            my_in_feat_sm[i] = event_slots[e].in_feat[i];
+        }
+        __syncwarp();
+
+        constexpr int QVG_STRIDE = 3 * OUT * IN;
+        constexpr int GOW_STRIDE = OUT * OUT;
+        const float* qvg_w = layer.qvgIn + (long long)delta * QVG_STRIDE;
+
+        const bool need_output = (output_mask == 0) || (output_mask[e] != 0);
+        if (need_output) {
+            const float* go_w = layer.goW + (long long)delta * GOW_STRIDE;
+            float* contrib_slot = contrib + ((long long)e * N_WARPS + warp_id) * OUT;
+            process_patch_cell<IN, OUT>(
+                my_in_feat_sm, qvg_w, go_w,
+                hidden + (long long)patch_idx * OUT,
+                my_qh_sm, contrib_slot);
+        } else {
+            process_patch_cell_state_only<IN, OUT>(
+                my_in_feat_sm, qvg_w,
+                hidden + (long long)patch_idx * OUT);
+        }
+    }
+    __syncthreads();
+
+    // GATHER + LN: only for events with output.
+    if (warp_id < batch_size) {
+        const int e = warp_id;
+        const bool entered = (enter_mask  == 0) || (enter_mask[e]  != 0);
+        const bool outputs = (output_mask == 0) || (output_mask[e] != 0);
+        if (entered && outputs) {
+            float* contrib_event = contrib + (long long)e * N_WARPS * OUT;
+            gather_residual_ln<OUT>(
+                contrib_event,
+                event_slots[e].residual,
+                layer.ln_gamma, layer.ln_beta,
+                event_slots[e].in_feat);
+        }
+    }
+    __syncthreads();
+}
+
+
 // ---- Parallel tdrop (cell-owner partition) --------------------------------
 //
 // Same logic as serial_tdrop but distributed across 9 warps. Warp w handles
@@ -716,19 +879,28 @@ void k_ssla_s2s3_celled_drain_n(
         }
         __syncthreads();
 
-        // ---- Stage 2 ---- (implicit dispatch + parallel tdrop)
-        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
-                                  event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
-        run_layer_celled_implicit<C2, C2>(batch_size, cfg.H2, cfg.W2,
-                                  event_slots, /*mask=*/0,
-                                  cfg.layers[blk][1], cfg.hidden[blk][1],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // ---- tdrop_s2 EARLY: compute pass2 before L5 so L5 can skip
+        //      goW + gather + LN for events that will be dropped (saves
+        //      ~75% of L5's output work). Counter increment order is
+        //      preserved (parallel_tdrop walks events in index order per
+        //      warp's owned cell).
         parallel_tdrop(batch_size, cfg.tdrop_window,
                        cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
                        pass2);
         __syncthreads();
+
+        // ---- Stage 2 ----
+        // L4: full work for all events — output feeds L5 hidden state.
+        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*mask=*/0,
+                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // L5: qvg+lru for all events (hidden state must evolve), but skip
+        // goW+gather+LN for events that will be tdrop-dropped (output unused).
+        run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*enter_mask=*/0, /*output_mask=*/pass2,
+                                  cfg.layers[blk][1], cfg.hidden[blk][1],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
         // Pool s2 coords → s3 coords (in-place in event_slots).
         if (threadIdx.x == 0) {
@@ -739,19 +911,24 @@ void k_ssla_s2s3_celled_drain_n(
         }
         __syncthreads();
 
-        // ---- Stage 3 ---- (implicit dispatch + parallel tdrop, pass2-masked)
-        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
-                                  event_slots, /*mask=*/pass2,
-                                  cfg.layers[blk][2], cfg.hidden[blk][2],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
-        run_layer_celled_implicit<C3, C3>(batch_size, cfg.H3, cfg.W3,
-                                  event_slots, /*mask=*/pass2,
-                                  cfg.layers[blk][3], cfg.hidden[blk][3],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // ---- tdrop_s3 EARLY: compute pass3 before L7 so L7 can skip output.
         parallel_tdrop(batch_size, cfg.tdrop_window,
                        cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
                        pass3);
         __syncthreads();
+
+        // ---- Stage 3 ----
+        // L6: only pass2 events enter and produce output (current behaviour).
+        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*mask=*/pass2,
+                                  cfg.layers[blk][2], cfg.hidden[blk][2],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // L7: pass2 events do qvg+lru (state evolves), but only pass3 events
+        // do goW+gather+LN+head.
+        run_layer_celled_implicit_split<C3, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*enter_mask=*/pass2, /*output_mask=*/pass3,
+                                  cfg.layers[blk][3], cfg.hidden[blk][3],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
         // ---- Write output slots (P1 oracle harness) ----
         // Output slot follows ssla_s2_s3_head conventions:
@@ -861,19 +1038,21 @@ void k_ssla_s2s3_celled_drain_n_multi(
         }
         __syncthreads();
 
-        // Stage 2: implicit dispatch + parallel tdrop.
-        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
-                                  event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
-        run_layer_celled_implicit<C2, C2>(batch_size, cfg.H2, cfg.W2,
-                                  event_slots, /*mask=*/0,
-                                  cfg.layers[blk][1], cfg.hidden[blk][1],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // ---- tdrop_s2 EARLY ----
         parallel_tdrop(batch_size, cfg.tdrop_window,
                        cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
                        pass2);
         __syncthreads();
+
+        // Stage 2.
+        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*mask=*/0,
+                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*enter=*/0, /*output=*/pass2,
+                                  cfg.layers[blk][1], cfg.hidden[blk][1],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
         if (threadIdx.x == 0) {
             for (int e = 0; e < batch_size; ++e) {
@@ -883,19 +1062,21 @@ void k_ssla_s2s3_celled_drain_n_multi(
         }
         __syncthreads();
 
-        // Stage 3: implicit dispatch + parallel tdrop.
-        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
-                                  event_slots, /*mask=*/pass2,
-                                  cfg.layers[blk][2], cfg.hidden[blk][2],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
-        run_layer_celled_implicit<C3, C3>(batch_size, cfg.H3, cfg.W3,
-                                  event_slots, /*mask=*/pass2,
-                                  cfg.layers[blk][3], cfg.hidden[blk][3],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // ---- tdrop_s3 EARLY ----
         parallel_tdrop(batch_size, cfg.tdrop_window,
                        cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
                        pass3);
         __syncthreads();
+
+        // Stage 3.
+        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*mask=*/pass2,
+                                  cfg.layers[blk][2], cfg.hidden[blk][2],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled_implicit_split<C3, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*enter=*/pass2, /*output=*/pass3,
+                                  cfg.layers[blk][3], cfg.hidden[blk][3],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
         if (out != 0) {
             for (int e = 0; e < batch_size; ++e) {
@@ -1062,19 +1243,21 @@ void k_ssla_s2s3_celled_persistent(
         }
         __syncthreads();
 
-        // ---- Stage 2 ---- (implicit dispatch + parallel tdrop)
-        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
-                                  event_slots, /*mask=*/0,
-                                  cfg.layers[blk][0], cfg.hidden[blk][0],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
-        run_layer_celled_implicit<C2, C2>(batch_size, cfg.H2, cfg.W2,
-                                  event_slots, /*mask=*/0,
-                                  cfg.layers[blk][1], cfg.hidden[blk][1],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // ---- tdrop_s2 EARLY ----
         parallel_tdrop(batch_size, cfg.tdrop_window,
                        cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
                        pass2);
         __syncthreads();
+
+        // ---- Stage 2 ----
+        run_layer_celled_implicit<C1, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*mask=*/0,
+                                  cfg.layers[blk][0], cfg.hidden[blk][0],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled_implicit_split<C2, C2>(batch_size, cfg.H2, cfg.W2,
+                                  event_slots, /*enter=*/0, /*output=*/pass2,
+                                  cfg.layers[blk][1], cfg.hidden[blk][1],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
         // Pool s2 coords → s3 coords.
         if (threadIdx.x == 0) {
@@ -1085,19 +1268,21 @@ void k_ssla_s2s3_celled_persistent(
         }
         __syncthreads();
 
-        // ---- Stage 3 ---- (implicit dispatch + parallel tdrop)
-        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
-                                  event_slots, /*mask=*/pass2,
-                                  cfg.layers[blk][2], cfg.hidden[blk][2],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
-        run_layer_celled_implicit<C3, C3>(batch_size, cfg.H3, cfg.W3,
-                                  event_slots, /*mask=*/pass2,
-                                  cfg.layers[blk][3], cfg.hidden[blk][3],
-                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        // ---- tdrop_s3 EARLY ----
         parallel_tdrop(batch_size, cfg.tdrop_window,
                        cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
                        pass3);
         __syncthreads();
+
+        // ---- Stage 3 ----
+        run_layer_celled_implicit<C2, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*mask=*/pass2,
+                                  cfg.layers[blk][2], cfg.hidden[blk][2],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
+        run_layer_celled_implicit_split<C3, C3>(batch_size, cfg.H3, cfg.W3,
+                                  event_slots, /*enter=*/pass2, /*output=*/pass3,
+                                  cfg.layers[blk][3], cfg.hidden[blk][3],
+                                  contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
         // ---- Head matvec + predictions write for owner+pass3 events ----
         // One warp per event (warp_id < batch_size). event_slots[e].in_feat
