@@ -45,9 +45,58 @@ class BlockTopo:
     proc_y_hi:  int
 
 
+def _balanced_splits(extent: int, n_strips: int) -> List[int]:
+    """Return n_strips+1 boundary indices in [0, extent] such that the
+    per-strip proc width (= owned + halo on each non-boundary side) is
+    equal across strips. For n_strips >= 3, this gives unequal owned
+    sizes: corner strips (touching boundary) get an extra `HALO` cells
+    so corner_proc == middle_proc. For n_strips <= 2, all strips touch
+    a boundary on the same side (one-sided halo only) and uniform split
+    is balanced.
+    """
+    if n_strips == 1:
+        return [0, extent]
+    if n_strips == 2:
+        size = extent // 2
+        return [0, size, extent]
+    # n_strips >= 3: corners (top+bot) own `middle + HALO` extra cells so
+    # all proc widths equal. Solve: 2*(middle+HALO) + (n-2)*middle = extent.
+    middle = (extent - 2 * HALO) // n_strips
+    if middle < 1:
+        # Fall back to uniform if uneven split would give zero/negative.
+        size = extent // n_strips
+        return [i * size if i < n_strips else extent for i in range(n_strips + 1)]
+    corner = middle + HALO
+    total = 2 * corner + (n_strips - 2) * middle
+    # Distribute any remainder to the corners.
+    deficit = extent - total
+    corner_lo_extra = deficit // 2
+    corner_hi_extra = deficit - corner_lo_extra
+    splits = [0]
+    cur = 0
+    for i in range(n_strips):
+        if i == 0:
+            sz = corner + corner_lo_extra
+        elif i == n_strips - 1:
+            sz = corner + corner_hi_extra
+        else:
+            sz = middle
+        cur += sz
+        splits.append(cur)
+    assert splits[-1] == extent, f"split mismatch: {splits} for extent={extent}"
+    return splits
+
+
 def grid_topology(n_blocks: int, W2: int, H2: int) -> List[BlockTopo]:
     """Return per-block (owned, proc) ranges. owned cells are disjoint
-    across blocks; proc cells overlap by halo with neighbours."""
+    across blocks; proc cells overlap by halo with neighbours.
+
+    For 4-strip-on-one-axis topologies (e.g. n_blocks=8 = 2W×4H), the
+    middle strips would normally accumulate halo on BOTH sides, making
+    them ~1.33× bigger than corner strips. We use _balanced_splits so
+    middle owned ranges are smaller, equalizing proc width across all
+    strips — measured to shift saturation off the middle blocks.
+    """
     if n_blocks == 2:
         nw, nh = 2, 1
     elif n_blocks == 4:
@@ -57,17 +106,14 @@ def grid_topology(n_blocks: int, W2: int, H2: int) -> List[BlockTopo]:
     else:
         raise ValueError(f"unsupported n_blocks={n_blocks}; use 2, 4, or 8")
     assert nw * nh == n_blocks
-    # Even split (W2 / nw and H2 / nh must be integers for now).
-    assert W2 % nw == 0, f"W2={W2} not divisible by nw={nw}"
-    assert H2 % nh == 0, f"H2={H2} not divisible by nh={nh}"
-    sw, sh = W2 // nw, H2 // nh
+
+    x_splits = _balanced_splits(W2, nw)
+    y_splits = _balanced_splits(H2, nh)
     out = []
     for bw in range(nw):
         for bh in range(nh):
-            ox_lo = bw * sw
-            ox_hi = ox_lo + sw
-            oy_lo = bh * sh
-            oy_hi = oy_lo + sh
+            ox_lo, ox_hi = x_splits[bw], x_splits[bw + 1]
+            oy_lo, oy_hi = y_splits[bh], y_splits[bh + 1]
             out.append(BlockTopo(
                 owned_x_lo=ox_lo, owned_x_hi=ox_hi,
                 owned_y_lo=oy_lo, owned_y_hi=oy_hi,
