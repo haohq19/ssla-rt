@@ -134,6 +134,105 @@ __device__ inline void run_layer_celled_profiled(
 }
 
 
+// Split-mask variant. Mirrors run_layer_celled_implicit_split: events with
+// output_mask=0 skip goW + gather + LN, only do qvg+lru (state-only).
+template <int IN, int OUT>
+__device__ inline void run_layer_celled_split_profiled(
+    int batch_size,
+    int Hl, int Wl,
+    EventSlot*               event_slots,
+    const int*               enter_mask,
+    const int*               output_mask,
+    const LayerWeightsS2S3&  layer,
+    float*                   hidden,
+    float*                   contrib,
+    float*                   per_warp_in_feat_sm,
+    float*                   per_warp_qh_sm,
+    unsigned long long*      phase_clk,
+    int                      batch_idx,
+    int                      ph_res, int ph_zero, int ph_compute, int ph_gather)
+{
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int own_y   = warp_id / 3;
+    const int own_x   = warp_id % 3;
+
+    // RESIDUAL: only for events with output.
+    if (warp_id < batch_size) {
+        const int e = warp_id;
+        const bool entered = (enter_mask  == 0) || (enter_mask[e]  != 0);
+        const bool outputs = (output_mask == 0) || (output_mask[e] != 0);
+        if (entered && outputs) {
+            compute_residual<IN, OUT>(event_slots[e].in_feat, layer.input_proj,
+                                      event_slots[e].residual);
+        }
+    }
+    STAMP(ph_res);
+
+    const int n_contrib_floats = batch_size * N_WARPS * OUT;
+    for (int i = threadIdx.x; i < n_contrib_floats; i += blockDim.x) {
+        contrib[i] = 0.0f;
+    }
+    STAMP(ph_zero);
+
+    // COMPUTE
+    float* my_in_feat_sm = per_warp_in_feat_sm + warp_id * IN;
+    float* my_qh_sm      = per_warp_qh_sm + warp_id * OUT;
+
+    for (int e = 0; e < batch_size; ++e) {
+        if (enter_mask != 0 && enter_mask[e] == 0) continue;
+        const int evx = event_slots[e].evx;
+        const int evy = event_slots[e].evy;
+        const int dy  = ((own_y - evy) % 3 + 3) % 3 - 1;
+        const int dx  = ((own_x - evx) % 3 + 3) % 3 - 1;
+        const int py  = evy + dy;
+        const int px  = evx + dx;
+        if (py < 0 || py >= Hl || px < 0 || px >= Wl) continue;
+        const int delta     = (1 - dy) * 3 + (1 - dx);
+        const int patch_idx = py * Wl + px;
+
+        for (int i = lane; i < IN; i += 32) {
+            my_in_feat_sm[i] = event_slots[e].in_feat[i];
+        }
+        __syncwarp();
+
+        constexpr int QVG_STRIDE = 3 * OUT * IN;
+        constexpr int GOW_STRIDE = OUT * OUT;
+        const float* qvg_w = layer.qvgIn + (long long)delta * QVG_STRIDE;
+        const bool need_output = (output_mask == 0) || (output_mask[e] != 0);
+        if (need_output) {
+            const float* go_w = layer.goW + (long long)delta * GOW_STRIDE;
+            float* contrib_slot = contrib + ((long long)e * N_WARPS + warp_id) * OUT;
+            process_patch_cell<IN, OUT>(
+                my_in_feat_sm, qvg_w, go_w,
+                hidden + (long long)patch_idx * OUT,
+                my_qh_sm, contrib_slot);
+        } else {
+            process_patch_cell_state_only<IN, OUT>(
+                my_in_feat_sm, qvg_w,
+                hidden + (long long)patch_idx * OUT);
+        }
+    }
+    STAMP(ph_compute);
+
+    // GATHER + LN: only for output events.
+    if (warp_id < batch_size) {
+        const int e = warp_id;
+        const bool entered = (enter_mask  == 0) || (enter_mask[e]  != 0);
+        const bool outputs = (output_mask == 0) || (output_mask[e] != 0);
+        if (entered && outputs) {
+            float* contrib_event = contrib + (long long)e * N_WARPS * OUT;
+            gather_residual_ln<OUT>(
+                contrib_event,
+                event_slots[e].residual,
+                layer.ln_gamma, layer.ln_beta,
+                event_slots[e].in_feat);
+        }
+    }
+    STAMP(ph_gather);
+}
+
+
 extern "C" __global__
 __launch_bounds__(N_WARPS * 32, 1)
 void k_ssla_s2s3_celled_drain_n_profile(
@@ -201,8 +300,15 @@ void k_ssla_s2s3_celled_drain_n_profile(
         }
         STAMP(PH_LOAD);
 
-        // STAGE 2 (implicit dispatch + parallel tdrop)
-        STAMP(PH_DISPATCH_S2);   // no-op now, but kept for phase-index parity
+        // Production flow: tdrop_s2 BEFORE L5 so L5 can skip output for
+        // dropped events. Use STAMP(PH_DISPATCH_S2) for the now-early
+        // tdrop call (phase-index parity with old layout).
+        parallel_tdrop(batch_size, cfg.tdrop_window,
+                       cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
+                       pass2);
+        STAMP(PH_DISPATCH_S2);
+
+        // L4: full work for all events.
         run_layer_celled_profiled<C1, C2>(
             batch_size, cfg.H2, cfg.W2,
             event_slots, /*mask=*/0,
@@ -210,16 +316,15 @@ void k_ssla_s2s3_celled_drain_n_profile(
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L4_RES, PH_L4_ZERO, PH_L4_COMPUTE, PH_L4_GATHER);
-        run_layer_celled_profiled<C2, C2>(
+        // L5: qvg+lru for ALL events, but goW+gather+LN only for pass2.
+        run_layer_celled_split_profiled<C2, C2>(
             batch_size, cfg.H2, cfg.W2,
-            event_slots, /*mask=*/0,
+            event_slots, /*enter=*/0, /*output=*/pass2,
             cfg.layers[blk][1], cfg.hidden[blk][1],
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L5_RES, PH_L5_ZERO, PH_L5_COMPUTE, PH_L5_GATHER);
-        parallel_tdrop(batch_size, cfg.tdrop_window,
-                       cfg.tdrop_s2[blk], event_slots, cfg.W2, /*mask=*/0,
-                       pass2);
+        // PH_TDROP_S2 stamp now marks the end of the split-L5 phase.
         STAMP(PH_TDROP_S2);
 
         if (threadIdx.x == 0) {
@@ -230,8 +335,12 @@ void k_ssla_s2s3_celled_drain_n_profile(
         }
         STAMP(PH_POOL);
 
-        // STAGE 3 (implicit dispatch + parallel tdrop)
-        STAMP(PH_DISPATCH_S3);   // no-op now
+        // tdrop_s3 BEFORE L7 to enable skip there.
+        parallel_tdrop(batch_size, cfg.tdrop_window,
+                       cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
+                       pass3);
+        STAMP(PH_DISPATCH_S3);
+
         run_layer_celled_profiled<C2, C3>(
             batch_size, cfg.H3, cfg.W3,
             event_slots, /*mask=*/pass2,
@@ -239,16 +348,13 @@ void k_ssla_s2s3_celled_drain_n_profile(
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L6_RES, PH_L6_ZERO, PH_L6_COMPUTE, PH_L6_GATHER);
-        run_layer_celled_profiled<C3, C3>(
+        run_layer_celled_split_profiled<C3, C3>(
             batch_size, cfg.H3, cfg.W3,
-            event_slots, /*mask=*/pass2,
+            event_slots, /*enter=*/pass2, /*output=*/pass3,
             cfg.layers[blk][3], cfg.hidden[blk][3],
             contrib, per_warp_in_feat_sm, per_warp_qh_sm,
             phase_clk, batch_idx,
             PH_L7_RES, PH_L7_ZERO, PH_L7_COMPUTE, PH_L7_GATHER);
-        parallel_tdrop(batch_size, cfg.tdrop_window,
-                       cfg.tdrop_s3[blk], event_slots, cfg.W3, /*mask=*/pass2,
-                       pass3);
         STAMP(PH_TDROP_S3);
 
         if (out != 0) {
