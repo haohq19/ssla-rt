@@ -7,9 +7,11 @@ H_owned = [0, H2) on both strips.
 """
 import argparse
 import ctypes
+import datetime as _dt
 import os
 import sys
 import signal
+import threading
 import time
 
 import numpy as np
@@ -51,6 +53,104 @@ def _read_u64(devptr):
     return int(arr[0])
 
 
+class CameraReader(threading.Thread):
+    """Read DVXplorer events, apply camera-side ROI/threshold/subsample,
+    pack into the (n, 4) float32 layout libstage01_to_gpu expects, push
+    via S01gAPI.submit.
+
+    Coordinate flow:
+      sensor event at (x_sensor, y_sensor)
+        → divide by subsample factor `ds` (chip-side subsample, so events
+          actually arrive already at /ds coords on DVXplorer Micro — but
+          we divide defensively in case future cameras don't subsample
+          server-side)
+        → if outside H_full × W_full grid: dropped
+        → submitted to CPU pipeline at (x // ds, y // ds)
+
+    ROI is set via cam.setCropArea(x, y, w, h); events outside the crop
+    are not delivered by the camera, so they don't reach this code.
+    """
+    SS_LADDER = {"EVERY_PIXEL": 1, "EVERY_SECOND": 2,
+                 "EVERY_FOURTH": 4, "EVERY_EIGHTH": 8}
+
+    def __init__(self, api, args, stop_event):
+        super().__init__(daemon=True)
+        self.api = api
+        self.args = args
+        self.stop_event = stop_event
+        self.events_in = 0
+        self.batches_in = 0
+        self.cam = None
+
+    def run(self):
+        import dv_processing as dv
+        self.cam = dv.io.camera.open()
+        W_cam, H_cam = self.cam.getEventResolution()
+        print(f"[cam] opened {self.cam.getCameraName()} "
+              f"(serial {self.cam.getSerialNumber()})  sensor={W_cam}×{H_cam}",
+              flush=True)
+
+        SS = dv.io.camera.DVXplorer.SubSample
+        ss_name = self.args.cam_subsample
+        ss_val = getattr(SS, ss_name)
+        ds = self.SS_LADDER[ss_name]
+
+        # Centered ROI from --roi-pct (linear, both dims). pct=100 → full.
+        roi_pct = max(1.0, min(100.0, self.args.roi_pct))
+        roi_w = int(W_cam * roi_pct / 100.0)
+        roi_h = int(H_cam * roi_pct / 100.0)
+        roi_x = (W_cam - roi_w) // 2
+        roi_y = (H_cam - roi_h) // 2
+
+        # Clamp contrast to chip-level valid 0-17 (chip silently clamps
+        # higher values — see docs/DEV_GUIDE.md §6.2).
+        contrast = max(0, min(17, self.args.contrast))
+        try:
+            self.cam.setSubSampleHorizontal(ss_val)
+            self.cam.setSubSampleVertical(ss_val)
+            self.cam.setContrastThresholdOn(contrast)
+            self.cam.setContrastThresholdOff(contrast)
+            self.cam.setTimeInterval(_dt.timedelta(microseconds=self.args.cam_interval_us))
+            self.cam.setMIPITimeoutValue(_dt.timedelta(microseconds=self.args.cam_interval_us))
+            if roi_pct < 100.0:
+                self.cam.setCropArea((roi_x, roi_y, roi_w, roi_h))
+        except Exception as e:
+            print(f"[cam] knob set failed: {e}", flush=True)
+
+        print(f"[cam] contrast={contrast}  subsample={ss_name}(/{ds})  "
+              f"roi_pct={roi_pct} → crop ({roi_x},{roi_y}) {roi_w}×{roi_h}",
+              flush=True)
+
+        t0 = None
+        H_full, W_full = self.args.h_full, self.args.w_full
+        while not self.stop_event.is_set():
+            if not self.cam.isRunning():
+                time.sleep(0.001); continue
+            batch = self.cam.getNextEventBatch()
+            if batch is None or batch.size() == 0:
+                time.sleep(0.0005); continue
+            ev = batch.numpy()
+            if t0 is None:
+                t0 = int(ev["timestamp"][0])
+            n = ev.size
+            packed = np.empty((n, 4), dtype=np.float32, order="C")
+            packed[:, 0] = (ev["timestamp"] - t0).astype(np.float32)
+            packed[:, 1] = (ev["x"].astype(np.int32) // ds).astype(np.float32)
+            packed[:, 2] = (ev["y"].astype(np.int32) // ds).astype(np.float32)
+            packed[:, 3] = ev["polarity"].astype(np.float32)
+            # Drop events that fall outside the H_full × W_full grid
+            # (e.g., if the sensor returns coords past our SSLA grid after
+            # subsampling). These would otherwise hit OOB cells.
+            valid = ((packed[:, 1] >= 0) & (packed[:, 1] < W_full) &
+                     (packed[:, 2] >= 0) & (packed[:, 2] < H_full))
+            if not valid.all():
+                packed = packed[valid]
+                if packed.shape[0] == 0:
+                    continue
+            self.events_in += self.api.submit(packed)
+            self.batches_in += 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--weights", required=True)
@@ -62,8 +162,25 @@ def main():
     ap.add_argument("--base-core", type=int, default=1)
     ap.add_argument("--pin-python-main", action="store_true")
     ap.add_argument("--python-pin-core", type=int, default=0)
-    ap.add_argument("--cpp-synth", action="store_true")
+    ap.add_argument("--cpp-synth", action="store_true",
+                    help="Use synthetic event generator (mutually exclusive "
+                         "with camera input; default if no camera flags set).")
     ap.add_argument("--synth-pin-core", type=int, default=7)
+    # ---- Camera mode (active if --cpp-synth NOT set) ----
+    ap.add_argument("--contrast", type=int, default=17,
+                    help="DVXplorer contrast threshold ON/OFF (clamped to 0-17; "
+                         "chip silently clamps above 17 — see DEV_GUIDE §6.2)")
+    ap.add_argument("--cam-subsample", type=str, default="EVERY_EIGHTH",
+                    choices=["EVERY_PIXEL", "EVERY_SECOND",
+                             "EVERY_FOURTH", "EVERY_EIGHTH"],
+                    help="Chip-side subsample factor (1/2/4/8 x). Default 8x "
+                         "matches the 640×480 sensor → 80×60 grid mapping.")
+    ap.add_argument("--roi-pct", type=float, default=100.0,
+                    help="Centered crop to N%% × N%% of sensor (linear, both "
+                         "dims). 100 = full sensor. 50 = 25%% area, etc.")
+    ap.add_argument("--cam-interval-us", type=int, default=2000,
+                    help="DVXplorer batch interval (µs). Lower = lower latency, "
+                         "more frequent small batches.")
     ap.add_argument("--shard-ring-cap", type=int, default=16)
     ap.add_argument("--tdrop", type=int, default=4)
     ap.add_argument("--ring-cap", type=int, default=1 << 16)
@@ -230,6 +347,14 @@ def main():
         print(f"C++ synth dispatcher @ {args.synthetic_mev:.2f} Mev/s "
               f"(pin core {args.synth_pin_core})", flush=True)
 
+    # If not synth, start camera reader thread.
+    cam_stop_event = threading.Event()
+    cam_reader = None
+    if not args.cpp_synth:
+        cam_reader = CameraReader(api, args, cam_stop_event)
+        cam_reader.start()
+        time.sleep(0.3)   # let camera open before main loop polls events_done
+
     stop_flag_view = (ctypes.c_int32 * 1).from_address(stop_flag)
 
     def on_sigint(sig, frame):
@@ -258,6 +383,11 @@ def main():
     print("[main] duration reached, stopping", flush=True)
     if args.cpp_synth:
         api.lib.s01g_stop_synthetic(api.handle)
+    if cam_reader is not None:
+        cam_stop_event.set()
+        cam_reader.join(timeout=1.0)
+        print(f"[cam] {cam_reader.events_in} events submitted from "
+              f"{cam_reader.batches_in} batches", flush=True)
     stop_flag_view[0] = 1
     from cuda import cuda
     err, = cuda.cuCtxSynchronize()
