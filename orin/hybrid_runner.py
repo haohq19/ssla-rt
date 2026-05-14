@@ -588,9 +588,15 @@ def main() -> int:
     #   Without root + jetson_clocks the SM clock is DVFS-controlled and
     #   the linear fit between the two anchors carries a ms-scale residual
     #   error. Treat e2e numbers as upper-bounded by ~5 ms calibration bias.
+    # `owner == 1` means: spatial owner AND passed both tdrop_s2 AND
+    # tdrop_s3 — i.e. event produces a final prediction. Latency stats in
+    # the "n_pred" column cover only these events (downstream-visible).
+    # The "n_all" column is every timed slot (output-producing + dropped)
+    # for sanity comparison — at saturation they share the same per-batch
+    # t_pop/t_done so values should look similar.
     print(f"\n[gpu lat] CPU-push → GPU-done (calibration ±~5 ms, "
           f"ring cap = {args.timing_cap})")
-    print(f"{'block':>5} | {'n_owner':>7} {'e2e p50':>8} {'e2e p99':>8} "
+    print(f"{'block':>5} | {'n_pred':>7} {'e2e p50':>8} {'e2e p99':>8} "
           f"{'e2e max':>8} | {'krn p50':>8} {'krn p99':>8} | "
           f"{'n_all':>7} {'e2e p50':>8} {'e2e p99':>8} µs")
     for b in range(N_BLOCKS):
@@ -622,9 +628,9 @@ def main() -> int:
         krn_us = (t_done_cyc - tv["t_pop_clk"][idx].astype(np.int64)) \
                  * (1e6 / SM_CLK_HZ)
 
-        owner_mask = tv["owner"][idx] == 1
-        own_e2e = e2e_us[owner_mask]
-        own_krn = krn_us[owner_mask]
+        pred_mask = tv["owner"][idx] == 1
+        own_e2e = e2e_us[pred_mask]
+        own_krn = krn_us[pred_mask]
         def _pct(a, p):
             return float(np.percentile(a, p)) if a.size else 0.0
         def _max(a):

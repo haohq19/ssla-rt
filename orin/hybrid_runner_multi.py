@@ -275,16 +275,25 @@ def main():
         print(f"  blk{b}: head={head:8d} done={done:8d} lag={head-done}")
 
     # ---- 8. End-to-end latency from timing slots --------------------------
+    # Latency stats are computed ONLY over events that produce a final
+    # prediction (`is_owner AND pass_tdrop_s2 AND pass_tdrop_s3` — flagged
+    # as `owner == 1` in the timing slot). Events dropped by either tdrop
+    # are excluded because their predictions are never read; their kernel-
+    # internal timing is the same as output-producing events in the same
+    # batch anyway (per-batch t_pop_clk and t_done_clk are shared), so the
+    # filter doesn't change the underlying numbers — it just keeps the
+    # report focused on the events that matter for downstream consumers.
+    #
     # Three components per timing slot:
     #   emit→push  = CPU pipeline latency (synth/camera → CPU stage 0+1 → GPU ring publish)
-    #   push→done  = GPU pipeline latency (ring wait + 4 GPU layers)
-    #   emit→done  = whole pipeline latency
+    #   kernel     = GPU push→done (ring wait + 4 GPU layers + head)
+    #   emit→done  = whole pipeline ≈ emit→push + kernel (no cross-clock bias)
     # GPU-side t_done_clk is in SM cycles — translated via the per-block
     # two-point calibration (kernel_start_clk + kernel_end_clk anchored
     # against CPU CLOCK_MONOTONIC_RAW recorded at launch / sync).
-    print(f"\n[latency] WHOLE pipeline (emit → GPU done), per block:")
-    print(f"{'blk':>3} | {'n_owner':>7} | "
-          f"{'emit→push':>10} {'push→done':>10} {'emit→done':>10} (µs p50/p99/max)")
+    print(f"\n[latency] WHOLE pipeline (emit → GPU done), output-producing events only:")
+    print(f"{'blk':>3} | {'n_pred':>7} | "
+          f"{'emit→push':>10} {'kernel':>10} (µs p50/p99/max)")
     cyc0 = [int(kstart_view[b][0]) for b in range(args.gpu_blocks)]
     cyc1 = [int(kend_view[b][0])   for b in range(args.gpu_blocks)]
     for b in range(args.gpu_blocks):
@@ -316,7 +325,10 @@ def main():
                       tv["t_pop_clk"][idx].astype(np.int64))
                      * ns_per_cycle / 1000.0)
 
-        owner_mask = tv["owner"][idx] == 1
+        # `owner == 1` in the timing slot means: spatial owner AND passed
+        # both tdrop_s2 AND tdrop_s3 — i.e. the event produces a final
+        # prediction. Latency stats below cover only these events.
+        pred_mask = tv["owner"][idx] == 1
         def _pct3(arr, mask):
             sub = arr[mask] if mask.any() else arr
             if sub.size == 0:
@@ -324,17 +336,17 @@ def main():
             return (f"{float(np.percentile(sub,50)):>5.0f}",
                     f"{float(np.percentile(sub,99)):>5.0f}",
                     f"{float(sub.max()):>5.0f}")
-        a50, a99, amx = _pct3(emit_to_push, owner_mask)
-        k50, k99, kmx = _pct3(kernel_us, owner_mask)
-        n_owner = int(owner_mask.sum())
+        a50, a99, amx = _pct3(emit_to_push, pred_mask)
+        k50, k99, kmx = _pct3(kernel_us, pred_mask)
+        n_pred = int(pred_mask.sum())
         # CLEAN latency components (no cross-clock bias):
         #   emit→push : same CPU clock domain (CLOCK_MONOTONIC_RAW)
         #   kernel    : same GPU SM clock domain (t_done_clk − t_pop_clk)
         # Sum ≈ whole-pipeline lower bound (omits push→pop ring-wait,
         # which is ~few µs at low load).
-        print(f"{b:>3} | {n_owner:>7d} | "
+        print(f"{b:>3} | {n_pred:>7d} | "
               f"emit→push {a50}/{a99}/{amx}  "
-              f"kernel {k50}/{k99}/{kmx}")
+              f"kernel    {k50}/{k99}/{kmx}")
 
 
 if __name__ == "__main__":

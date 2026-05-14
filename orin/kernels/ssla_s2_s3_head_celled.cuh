@@ -67,7 +67,10 @@ struct GpuTimingSlot {
     unsigned long long t_pop_clk;
     unsigned long long t_done_clk;
     unsigned int       seq;
-    unsigned int       owner;
+    unsigned int       owner;        // 1 iff is_owner AND pass_tdrop_s2 AND
+                                     // pass_tdrop_s3 (i.e. event produced a
+                                     // final prediction). NOT just spatial
+                                     // ownership — see kernel write site.
     unsigned long long t_push_ns;   // copied from HybridInputRec at process time
     unsigned long long t_emit_ns;   // synth/camera emit time (whole-pipeline anchor)
 };
