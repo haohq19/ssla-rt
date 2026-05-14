@@ -127,10 +127,20 @@ def grid_topology(n_blocks: int, W2: int, H2: int) -> List[BlockTopo]:
 
 def build_n_block_random_layers(rng: np.random.Generator,
                                   n_blocks: int,
-                                  H2: int, W2: int, H3: int, W3: int):
-    """Build random weights (shared across blocks) plus N per-block
-    hidden state buffers per layer. Returns (cpu_layers, gpu_layers,
-    keepalive)."""
+                                  H2: int, W2: int, H3: int, W3: int,
+                                  *, npz=None):
+    """Build GPU L4..L7 weights + N per-block hidden state buffers.
+
+    If `npz` is provided, load layer weights from it (deploy indices 4..7
+    map to npz keys layers/4/... — note: the deploy-side conversion in
+    tools/convert_dsec_ckpt.py remaps the upstream's 0,1,4,5,8,9,12,13
+    indexing to the consecutive 0..7 used here, so 'GPU li=0' reads
+    'layers/4' in the npz). Otherwise weights are random.
+
+    Hidden state is always zero-initialized: SSLA's auto-regressive layers
+    must start with no recurrence to be reproducible. (The prior random
+    init was a stub-bench artifact; for trained inference zeros are correct.)
+    Returns (cpu_layers, gpu_layers, keepalive)."""
     cpu_layers = []
     gpu_layers = [[None] * 4 for _ in range(n_blocks)]
     keepalive = []
@@ -138,21 +148,39 @@ def build_n_block_random_layers(rng: np.random.Generator,
         in_d, out_d = SSLA_S2S3_IN_OUT[li]
         K = SSLA_S2S3_KERNELS[li]
         n_pos = K * K
-        Win  = rng.normal(scale=0.3, size=(in_d, n_pos * out_d)).astype(np.float32)
-        Wout = rng.normal(scale=0.3, size=(n_pos * out_d, out_d)).astype(np.float32)
-        qW = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
-        vW = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
-        gW = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
-        oW = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
-        qvgIn, goW = reshape_ssla_layer(Win, Wout, qW, vW, gW, oW, in_d, out_d)
-        if in_d != out_d:
-            input_proj = rng.normal(scale=0.3, size=(out_d, in_d)).astype(np.float32)
+        if npz is not None:
+            di = 4 + li   # deploy layer index for GPU layer `li`
+            Win  = np.asarray(npz[f"layers/{di}/W_in_cat"],  dtype=np.float32)
+            Wout = np.asarray(npz[f"layers/{di}/W_out_cat"], dtype=np.float32)
+            qW   = np.asarray(npz[f"layers/{di}/q_proj/weight"], dtype=np.float32)
+            vW   = np.asarray(npz[f"layers/{di}/v_proj/weight"], dtype=np.float32)
+            gW   = np.asarray(npz[f"layers/{di}/g_proj/weight"], dtype=np.float32)
+            oW   = np.asarray(npz[f"layers/{di}/o_proj/weight"], dtype=np.float32)
+            ip_key = f"layers/{di}/input_proj/weight"
+            input_proj = (np.asarray(npz[ip_key], dtype=np.float32)
+                          if ip_key in npz.files else None)
+            ln_gamma = np.asarray(npz[f"layers/{di}/norm/weight"], dtype=np.float32)
+            ln_beta  = np.asarray(npz[f"layers/{di}/norm/bias"],   dtype=np.float32)
+            if in_d != out_d and input_proj is None:
+                raise ValueError(f"layer {di}: in_d={in_d} != out_d={out_d} "
+                                 f"but no input_proj in npz")
         else:
-            input_proj = None
-        ln_gamma = (rng.normal(scale=0.1, size=out_d) + 1.0).astype(np.float32)
-        ln_beta  = rng.normal(scale=0.1, size=out_d).astype(np.float32)
+            Win  = rng.normal(scale=0.3, size=(in_d, n_pos * out_d)).astype(np.float32)
+            Wout = rng.normal(scale=0.3, size=(n_pos * out_d, out_d)).astype(np.float32)
+            qW   = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
+            vW   = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
+            gW   = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
+            oW   = rng.normal(scale=0.3, size=(out_d, out_d)).astype(np.float32)
+            input_proj = (rng.normal(scale=0.3, size=(out_d, in_d)).astype(np.float32)
+                          if in_d != out_d else None)
+            ln_gamma = (rng.normal(scale=0.1, size=out_d) + 1.0).astype(np.float32)
+            ln_beta  = rng.normal(scale=0.1, size=out_d).astype(np.float32)
+        qvgIn, goW = reshape_ssla_layer(Win, Wout, qW, vW, gW, oW, in_d, out_d)
         Hl, Wl = grid_for_layer(li, H2, W2, H3, W3)
-        H_init = rng.normal(scale=0.05, size=(Hl * Wl, out_d)).astype(np.float32)
+        if npz is not None:
+            H_init = np.zeros((Hl * Wl, out_d), dtype=np.float32)
+        else:
+            H_init = rng.normal(scale=0.05, size=(Hl * Wl, out_d)).astype(np.float32)
 
         cpu_layers.append(LayerRef(
             qvgIn=qvgIn.copy(), goW=goW.copy(),
@@ -260,7 +288,8 @@ def alloc_kernel_clk_n_block(n_blocks: int):
 def build_n_block_config(H2, W2, H3, W3, tdrop_window: int,
                            gpu_layers, tdrop_s2_dev, tdrop_s3_dev,
                            topo: List[BlockTopo],
-                           *, head_W=0, head_b=0, head_out_dim=HEAD_OUT_DEFAULT,
+                           *, head_W=0, head_b=0, head_ptrs=None,
+                           head_out_dim=HEAD_OUT_DEFAULT,
                            preds_dev=None, version_dev=None,
                            timing_dev=None, timing_mask=0,
                            kernel_start_clk=None, kernel_end_clk=None):
@@ -294,6 +323,17 @@ def build_n_block_config(H2, W2, H3, W3, tdrop_window: int,
         if kernel_end_clk   is not None: cfg.kernel_end_clk[b]   = kernel_end_clk[b]
     cfg.head_W = head_W
     cfg.head_b = head_b
+    if head_ptrs is not None:
+        cfg.head_cls_conv_W = head_ptrs["cls_conv_W"]
+        cfg.head_cls_conv_b = head_ptrs["cls_conv_b"]
+        cfg.head_cls_pred_W = head_ptrs["cls_pred_W"]
+        cfg.head_cls_pred_b = head_ptrs["cls_pred_b"]
+        cfg.head_reg_conv_W = head_ptrs["reg_conv_W"]
+        cfg.head_reg_conv_b = head_ptrs["reg_conv_b"]
+        cfg.head_reg_pred_W = head_ptrs["reg_pred_W"]
+        cfg.head_reg_pred_b = head_ptrs["reg_pred_b"]
+        cfg.head_obj_pred_W = head_ptrs["obj_pred_W"]
+        cfg.head_obj_pred_b = head_ptrs["obj_pred_b"]
     cfg.timing_mask = timing_mask
     p_cfg, cfg_ka = cuda_util.alloc_managed(ctypes.sizeof(CHybridS2S3Config))
     ctypes.memmove(p_cfg, ctypes.addressof(cfg), ctypes.sizeof(CHybridS2S3Config))

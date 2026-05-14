@@ -6,6 +6,7 @@ Mirrors hybrid_runner.py's structure but parametrised on --gpu-blocks
 H_owned = [0, H2) on both strips.
 """
 import argparse
+import collections
 import ctypes
 import datetime as _dt
 import os
@@ -22,7 +23,7 @@ from orin.nvrtc_util import CudaModule, arg_ptr, arg_u32, arg_u64  # noqa: E402
 from orin.hybrid_common import (  # noqa: E402
     INPUT_DTYPE, OUTPUT_DTYPE, TIMING_DTYPE,
     C1, C2, C3, MAX_BLOCKS, HEAD_OUT_DEFAULT,
-    build_head_weights, S01gAPI,
+    build_head_weights, load_two_layer_head_weights, S01gAPI,
 )
 from orin.multi_block import (  # noqa: E402
     BlockTopo, grid_topology, build_n_block_random_layers,
@@ -56,24 +57,14 @@ def _read_u64(devptr):
 class CameraReader(threading.Thread):
     """Read DVXplorer events, apply camera-side ROI/threshold/subsample,
     pack into the (n, 4) float32 layout libstage01_to_gpu expects, push
-    via S01gAPI.submit.
-
-    Coordinate flow:
-      sensor event at (x_sensor, y_sensor)
-        → divide by subsample factor `ds` (chip-side subsample, so events
-          actually arrive already at /ds coords on DVXplorer Micro — but
-          we divide defensively in case future cameras don't subsample
-          server-side)
-        → if outside H_full × W_full grid: dropped
-        → submitted to CPU pipeline at (x // ds, y // ds)
-
-    ROI is set via cam.setCropArea(x, y, w, h); events outside the crop
-    are not delivered by the camera, so they don't reach this code.
+    via S01gAPI.submit. Optionally also keep a deque of recent batches
+    for the demo display thread to read.
     """
     SS_LADDER = {"EVERY_PIXEL": 1, "EVERY_SECOND": 2,
                  "EVERY_FOURTH": 4, "EVERY_EIGHTH": 8}
 
-    def __init__(self, api, args, stop_event):
+    def __init__(self, api, args, stop_event,
+                 recent_buf=None, recent_lock=None):
         super().__init__(daemon=True)
         self.api = api
         self.args = args
@@ -81,6 +72,8 @@ class CameraReader(threading.Thread):
         self.events_in = 0
         self.batches_in = 0
         self.cam = None
+        self.recent_buf = recent_buf
+        self.recent_lock = recent_lock
 
     def run(self):
         import dv_processing as dv
@@ -162,6 +155,160 @@ class CameraReader(threading.Thread):
                     continue
             self.events_in += self.api.submit(packed)
             self.batches_in += 1
+            if self.recent_buf is not None:
+                with self.recent_lock:
+                    self.recent_buf.append((packed.copy(), time.monotonic()))
+
+
+def _collect_bboxes(preds_view, topo, frame_w, frame_h, scale,
+                    obj_thresh, W_full, H_full):
+    """Decode YOLOX-style head (5 box + 2 cls):
+      [0,1]: tx, ty   — center offset in s3-cell units
+      [2,3]: log_w, log_h — log size in s3-cell units
+      [4]:   objectness logit
+    s3 cell at (cy, cx) covers input [8·cy:8·cy+8] × [8·cx:8·cx+8].
+    Returns (boxes_xywh, scores, max_score_seen). Only cells with
+    sigmoid(obj_logit) ≥ obj_thresh are returned.
+    """
+    boxes_xywh, scores = [], []
+    max_seen = 0.0
+    for b, topo_b in enumerate(topo):
+        s3w = (topo_b.owned_x_hi - topo_b.owned_x_lo) >> 1
+        s3h = (topo_b.owned_y_hi - topo_b.owned_y_lo) >> 1
+        if s3w == 0 or s3h == 0:
+            continue
+        s3y_lo = topo_b.owned_y_lo >> 1
+        s3x_lo = topo_b.owned_x_lo >> 1
+        bp = preds_view[b]
+        obj = 1.0 / (1.0 + np.exp(-bp[:, 4]))
+        if obj.size:
+            max_seen = max(max_seen, float(obj.max()))
+        keep = np.where(obj >= obj_thresh)[0]
+        if keep.size == 0:
+            continue
+        cy_local = (keep // s3w).astype(np.float32)
+        cx_local = (keep %  s3w).astype(np.float32)
+        s3y = s3y_lo + cy_local
+        s3x = s3x_lo + cx_local
+        tx = bp[keep, 0]; ty = bp[keep, 1]
+        lw = bp[keep, 2]; lh = bp[keep, 3]
+        cx_in = s3x * 8.0 + 4.0 + tx * 8.0
+        cy_in = s3y * 8.0 + 4.0 + ty * 8.0
+        w_in  = np.clip(np.exp(lw) * 8.0, 2.0, float(W_full))
+        h_in  = np.clip(np.exp(lh) * 8.0, 2.0, float(H_full))
+        x1s = (cx_in - w_in / 2.0) * scale
+        y1s = (cy_in - h_in / 2.0) * scale
+        ws  = w_in * scale
+        hs  = h_in * scale
+        for i, k in enumerate(keep):
+            boxes_xywh.append([float(x1s[i]), float(y1s[i]),
+                               float(ws[i]),  float(hs[i])])
+            scores.append(float(obj[k]))
+    return boxes_xywh, scores, max_seen
+
+
+def display_loop(args, recent_buf, recent_lock, preds_view, topo,
+                 stats, stop_event, on_close):
+    """Live demo display. Refresh ~display_fps Hz.
+
+    Render at native H_full × W_full, scale up with cv2.resize (NEAREST),
+    then draw NMS-filtered bboxes. This is ~10× faster than splatting at
+    the upscaled resolution. cv2.waitKey itself paces the frame, so no
+    Python time.sleep loop is involved.
+    """
+    import cv2
+    H_full, W_full = args.h_full, args.w_full
+    scale = args.display_scale
+    win_s = args.event_window_ms / 1000.0
+    win_name = "SSLA Realtime Demo (ESC to quit)"
+    cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
+    frame_h = H_full * scale
+    frame_w = W_full * scale
+    period_ms = max(1, int(1000.0 / max(1, args.display_fps)))
+    small = np.zeros((H_full, W_full, 3), dtype=np.uint8)
+    last_frame_ms = 0.0
+    try:
+        while not stop_event.is_set():
+            t_frame_start = time.monotonic()
+
+            # 1) Drain stale entries, snapshot the rest under the lock.
+            cutoff = t_frame_start - win_s
+            with recent_lock:
+                while recent_buf and recent_buf[0][1] < cutoff:
+                    recent_buf.popleft()
+                batches = [b[0] for b in recent_buf]
+
+            # 2) Build raster at NATIVE resolution (cheap).
+            small.fill(0)
+            n_evts = 0
+            if batches:
+                ev_all = np.concatenate(batches, axis=0)
+                n_evts = ev_all.shape[0]
+                xs = ev_all[:, 1].astype(np.int32)
+                ys = ev_all[:, 2].astype(np.int32)
+                np.clip(xs, 0, W_full - 1, out=xs)
+                np.clip(ys, 0, H_full - 1, out=ys)
+                pos = ev_all[:, 3] > 0
+                small[ys[pos],  xs[pos]]  = (0, 0, 255)
+                small[ys[~pos], xs[~pos]] = (255, 80, 0)
+
+            # 3) Scale up once (NEAREST = visible square pixels, fast).
+            frame = cv2.resize(small, (frame_w, frame_h),
+                               interpolation=cv2.INTER_NEAREST)
+
+            # 4) Collect bboxes (with top-K fallback so user always sees the
+            #    model's best guesses, even when global confidence is low).
+            boxes_xywh, scores, max_obj = _collect_bboxes(
+                preds_view, topo, frame_w, frame_h, scale,
+                args.obj_thresh, W_full, H_full)
+            n_drawn = 0
+            if boxes_xywh:
+                keep_idx = cv2.dnn.NMSBoxes(
+                    boxes_xywh, scores,
+                    float(args.obj_thresh), float(args.nms_iou))
+                if len(keep_idx) > 0:
+                    keep_flat = np.asarray(keep_idx).flatten()
+                    for i in keep_flat:
+                        x, y, w, h = boxes_xywh[int(i)]
+                        sc = scores[int(i)]
+                        x1 = max(0, int(x));            y1 = max(0, int(y))
+                        x2 = min(frame_w - 1, int(x + w))
+                        y2 = min(frame_h - 1, int(y + h))
+                        cv2.rectangle(frame, (x1, y1), (x2, y2),
+                                      (0, 255, 0), 1)
+                        cv2.putText(frame, f"{sc:.2f}",
+                                    (x1, max(8, y1 - 2)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                    (0, 255, 0), 1, cv2.LINE_AA)
+                        n_drawn += 1
+
+            # 5) Stats overlay.
+            lines = [
+                f"admit : {stats['admit_kev_s']:6.1f} kev/s",
+                f"drain : {stats['drain_kev_s']:6.1f} kev/s",
+                f"queue : {stats['ring_lag']:6d} ev",
+                f"max obj : {max_obj:.3f}  (thresh {args.obj_thresh:.2f})",
+                f"bbox  : {n_drawn}",
+                f"events: {n_evts} in {args.event_window_ms} ms",
+                f"frame : {last_frame_ms:5.1f} ms",
+            ]
+            for i, line in enumerate(lines):
+                cv2.putText(frame, line, (8, 16 + i * 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                            (200, 255, 200), 1, cv2.LINE_AA)
+
+            cv2.imshow(win_name, frame)
+            # waitKey both pumps the GUI event loop and paces the frame:
+            # work + waitKey ≈ period_ms, so the loop is self-stabilising.
+            elapsed_ms = (time.monotonic() - t_frame_start) * 1000.0
+            wait_ms = max(1, period_ms - int(elapsed_ms))
+            key = cv2.waitKey(wait_ms) & 0xFF
+            last_frame_ms = (time.monotonic() - t_frame_start) * 1000.0
+            if key == 27:
+                on_close()
+                break
+    finally:
+        cv2.destroyAllWindows()
 
 
 def main():
@@ -210,6 +357,19 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--timing-cap", type=int, default=1 << 14)
     ap.add_argument("--synthetic-mev", type=float, default=2.0)
+    # ---- Realtime demo display (cv2 window with events + bboxes + stats) ----
+    ap.add_argument("--demo-display", action="store_true",
+                    help="Open a cv2 window showing live events, decoded "
+                         "bboxes from preds_view, and rate/queue stats.")
+    ap.add_argument("--display-fps", type=int, default=30)
+    ap.add_argument("--display-scale", type=int, default=4,
+                    help="Pixel scale factor for the event raster.")
+    ap.add_argument("--event-window-ms", type=int, default=50,
+                    help="Time window (ms) of events to render each frame.")
+    ap.add_argument("--obj-thresh", type=float, default=0.3,
+                    help="Sigmoid(obj_logit) confidence threshold for bboxes.")
+    ap.add_argument("--nms-iou", type=float, default=0.65,
+                    help="IoU threshold for NMS (cv2.dnn.NMSBoxes).")
     args = ap.parse_args()
 
     if args.pin_python_main:
@@ -229,12 +389,39 @@ def main():
               f"proc X[{t.proc_x_lo},{t.proc_x_hi}) Y[{t.proc_y_lo},{t.proc_y_hi})")
 
     # ---- 1. GPU resources --------------------------------------------------
+    # Try to load weights.npz from the weights dir; if present and contains
+    # the trained-head schema (head/cls_convs/0/0/weight etc.), the GPU side
+    # runs the 2-layer YOLOX head. Otherwise (or if the npz is missing the
+    # head keys) fall back to a random single-linear head.
     rng = np.random.default_rng(args.seed)
+    weights_npz_path = os.path.join(args.weights, "weights.npz")
+    if os.path.isfile(weights_npz_path):
+        npz = np.load(weights_npz_path)
+        has_gpu_layers = all(f"layers/{4+li}/W_in_cat" in npz.files for li in range(4))
+        has_trained_head = "head/cls_convs/0/0/weight" in npz.files
+        print(f"[weights] {weights_npz_path}: "
+              f"GPU layers {'LOADED' if has_gpu_layers else 'RANDOM'}, "
+              f"head {'TRAINED 2-layer' if has_trained_head else 'RANDOM linear'}",
+              flush=True)
+    else:
+        npz = None
+        has_gpu_layers = False
+        has_trained_head = False
+        print(f"[weights] {weights_npz_path} not found — GPU side fully random",
+              flush=True)
+
     cpu_layers, gpu_layers, ka_layers = build_n_block_random_layers(
-        rng, args.gpu_blocks, H2, W2, H3, W3)
+        rng, args.gpu_blocks, H2, W2, H3, W3,
+        npz=(npz if has_gpu_layers else None))
     tdrop_s2_dev, tdrop_s3_dev, ka_tdrop = alloc_tdrop_n_block(
         H2, W2, H3, W3, args.gpu_blocks)
-    head_W_dev, head_b_dev, ka_head = build_head_weights(rng, HEAD_OUT_DEFAULT)
+    if has_trained_head:
+        head_ptrs, ka_head = load_two_layer_head_weights(npz)
+        head_W_dev = 0
+        head_b_dev = 0
+    else:
+        head_W_dev, head_b_dev, ka_head = build_head_weights(rng, HEAD_OUT_DEFAULT)
+        head_ptrs = None
     preds_dev, preds_view, version_dev, version_view, ka_preds = \
         alloc_predictions_n_block(topo, HEAD_OUT_DEFAULT)
     timing_dev, timing_view, timing_mask, ka_timing = alloc_timing_n_block(
@@ -248,6 +435,7 @@ def main():
         H2, W2, H3, W3, args.tdrop,
         gpu_layers, tdrop_s2_dev, tdrop_s3_dev, topo,
         head_W=head_W_dev, head_b=head_b_dev,
+        head_ptrs=head_ptrs,
         preds_dev=preds_dev, version_dev=version_dev,
         timing_dev=timing_dev, timing_mask=timing_mask,
         kernel_start_clk=kstart_dev, kernel_end_clk=kend_dev,
@@ -368,11 +556,20 @@ def main():
         print(f"C++ synth dispatcher @ {args.synthetic_mev:.2f} Mev/s "
               f"(pin core {args.synth_pin_core})", flush=True)
 
+    # ---- Optional demo display: recent-events deque + cv2 window ---------
+    demo_enabled = args.demo_display
+    recent_buf = collections.deque(maxlen=4096) if demo_enabled else None
+    recent_lock = threading.Lock() if demo_enabled else None
+    stats = {"admit_kev_s": 0.0, "drain_kev_s": 0.0, "ring_lag": 0}
+    disp_stop_event = threading.Event() if demo_enabled else None
+
     # If not synth, start camera reader thread.
     cam_stop_event = threading.Event()
     cam_reader = None
     if not args.cpp_synth:
-        cam_reader = CameraReader(api, args, cam_stop_event)
+        cam_reader = CameraReader(api, args, cam_stop_event,
+                                  recent_buf=recent_buf,
+                                  recent_lock=recent_lock)
         cam_reader.start()
         time.sleep(0.3)   # let camera open before main loop polls events_done
 
@@ -381,27 +578,58 @@ def main():
     def on_sigint(sig, frame):
         print("\n[SIGINT] stopping", flush=True)
         stop_flag_view[0] = 1
+        if disp_stop_event is not None:
+            disp_stop_event.set()
     signal.signal(signal.SIGINT, on_sigint)
+
+    disp_thread = None
+    if demo_enabled:
+        def _on_close():
+            disp_stop_event.set()
+            stop_flag_view[0] = 1
+        disp_thread = threading.Thread(
+            target=display_loop,
+            args=(args, recent_buf, recent_lock, preds_view, topo,
+                  stats, disp_stop_event, _on_close),
+            daemon=True)
+        disp_thread.start()
 
     # ---- 6. Run for duration_s, periodic stats ----------------------------
     t_run_start = time.monotonic()
     t_next_stats = t_run_start + 1.0
+    # Stats cadence: 1 s for the log print AND for the shared demo dict —
+    # demo cares about smoothed kev/s, not noisy 50-ms windows.
     print(f"\n{'t':>5} | {'kev/s GPU':>10} | "
           + " ".join(f"d{b}" for b in range(args.gpu_blocks))
           + " | CPU per-block n_pushed", flush=True)
     last_done = [0] * args.gpu_blocks
+    last_admit = 0
     while time.monotonic() - t_run_start < args.duration_s:
+        if disp_stop_event is not None and disp_stop_event.is_set():
+            break
         if time.monotonic() >= t_next_stats:
             done = [_read_u64(events_done[b]) for b in range(args.gpu_blocks)]
             dones = [done[b] - last_done[b] for b in range(args.gpu_blocks)]
             total = sum(dones)
             print(f"{time.monotonic()-t_run_start:5.1f}s | {total/1e3:10.1f} | "
                   + " ".join(f"{d:6d}" for d in dones), flush=True)
+            # Update shared stats for demo overlay.
+            admit_now = cam_reader.events_in if cam_reader is not None else 0
+            stats["admit_kev_s"] = (admit_now - last_admit) / 1e3
+            stats["drain_kev_s"] = total / 1e3
+            # ring_lag = (head pushed by CPU) − (events drained by GPU)
+            heads = [_read_u64(ring_head[b]) for b in range(args.gpu_blocks)]
+            stats["ring_lag"] = int(sum(heads) - sum(done))
+            last_admit = admit_now
             last_done = done
             t_next_stats += 1.0
         time.sleep(0.05)
 
     print("[main] duration reached, stopping", flush=True)
+    if disp_stop_event is not None:
+        disp_stop_event.set()
+        if disp_thread is not None:
+            disp_thread.join(timeout=1.0)
     if args.cpp_synth:
         api.lib.s01g_stop_synthetic(api.handle)
     if cam_reader is not None:
@@ -415,6 +643,32 @@ def main():
     t_exit_cpu_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
     print(f"[main] cuCtxSynchronize: {err}", flush=True)
     api.shutdown()
+
+    # ---- Prediction-distribution summary (helps debug head behaviour) -----
+    all_obj_logits, all_max_per_cell = [], []
+    for b in range(args.gpu_blocks):
+        pv = preds_view[b]
+        vw = version_view[b]
+        nz = vw > 0
+        if nz.any():
+            ol = pv[nz, 4]
+            all_obj_logits.append(ol)
+            all_max_per_cell.append(float(ol.max()))
+    if all_obj_logits:
+        olc = np.concatenate(all_obj_logits)
+        obj_sig = 1.0 / (1.0 + np.exp(-olc))
+        print(f"\n[head] {olc.size} predicted cells; obj_logit range "
+              f"[{olc.min():.2f}, {olc.max():.2f}]  "
+              f"obj_sigmoid range [{obj_sig.min():.4f}, {obj_sig.max():.4f}]  "
+              f"p50={float(np.median(obj_sig)):.4f}  "
+              f"p99={float(np.percentile(obj_sig, 99)):.4f}")
+        if obj_sig.max() < 0.3:
+            print(f"[head] NOTE: max obj_sigmoid < 0.3 — model is not "
+                  f"confidently detecting at this resolution. The DSEC "
+                  f"checkpoint was trained at 640×430 with stride 8 "
+                  f"(s3 grid 80×54); we run 160×120 (s3 grid 20×15), so "
+                  f"objects appear 4× smaller than the trained scale. "
+                  f"Lower --obj-thresh to see what the head outputs anyway.")
 
     # ---- 7. Final stats ---------------------------------------------------
     head_done = sum(_read_u64(events_done[b]) for b in range(args.gpu_blocks))

@@ -93,8 +93,29 @@ struct HybridS2S3Config {
     float*           hidden[MAX_BLOCKS][4];
     unsigned char*   tdrop_s2[MAX_BLOCKS];
     unsigned char*   tdrop_s3[MAX_BLOCKS];
+    // Legacy single-linear head (random-weights / stub path):
+    //   preds[c, o] = head_W[i*7+o] · L7_feat[i] + head_b[o]
     const float*     head_W;
     const float*     head_b;
+    // 2-layer YOLOX head (real trained weights path; BN folded into conv).
+    // When `head_cls_conv_W` is non-null, the kernel runs the full head:
+    //   y_cls = SiLU(W_cls_conv · x + b_cls_conv)
+    //   cls   = W_cls_pred · y_cls + b_cls_pred                   (2)
+    //   y_reg = SiLU(W_reg_conv · x + b_reg_conv)
+    //   reg   = W_reg_pred · y_reg + b_reg_pred                   (4)
+    //   obj   = W_obj_pred · y_reg + b_obj_pred                   (1)
+    //   preds[c, 0..6] = [reg(4), obj(1), cls(2)]
+    // All W are stored (IN, OUT) row-major so matvec_w reads W[i*OUT + o].
+    const float*     head_cls_conv_W;   // (C3, C3)
+    const float*     head_cls_conv_b;   // (C3,)
+    const float*     head_cls_pred_W;   // (C3, 2)
+    const float*     head_cls_pred_b;   // (2,)
+    const float*     head_reg_conv_W;   // (C3, C3)
+    const float*     head_reg_conv_b;   // (C3,)
+    const float*     head_reg_pred_W;   // (C3, 4)
+    const float*     head_reg_pred_b;   // (4,)
+    const float*     head_obj_pred_W;   // (C3, 1)
+    const float*     head_obj_pred_b;   // (1,)
     float*           preds[MAX_BLOCKS];
     unsigned int*    version[MAX_BLOCKS];
     GpuTimingSlot*   timing[MAX_BLOCKS];
@@ -807,6 +828,80 @@ __device__ inline void serial_tdrop(
 }
 
 
+// ---- 2-layer YOLOX head (one warp per event) ------------------------------
+// Runs for owner+pass3 events. Reads the L7 output (C3=96 floats) from the
+// event's per-warp broadcast slot and produces 7 outputs at the event's s3
+// cell: [reg(4), obj(1), cls(2)]. Uses a per-warp 96-float smem buffer for
+// the intermediate post-SiLU activations (must outlive a __syncwarp).
+//
+// Caller is responsible for:
+//   - having warp_id < batch_size (one warp per event)
+//   - having gated on `is_owner && pass2 && pass3`
+//   - providing `y_act_sm`: 96 floats of scratch usable by this warp
+__device__ inline void do_two_layer_head(
+    const HybridS2S3Config& cfg, int blk,
+    const float* __restrict__ in_feat_sm,    // L7 output broadcast slot
+    float*       __restrict__ y_act_sm,      // 96 floats per warp scratch
+    int s3x, int s3y,
+    const HybridStrip& strip)
+{
+    const int lane = threadIdx.x & 31;
+    constexpr int HEAD_K3 = (C3 + 31) / 32;   // 3
+
+    // ---- CLS branch: 96 -> 96 (BN-fused) -> SiLU -> 96 -> 2 ----
+    float y_pre[HEAD_K3];
+    matvec_w<C3, C3>(in_feat_sm, cfg.head_cls_conv_W, y_pre);
+    #pragma unroll
+    for (int k = 0; k < HEAD_K3; ++k) {
+        const int o = lane + 32 * k;
+        if (o < C3) {
+            float v = y_pre[k] + cfg.head_cls_conv_b[o];
+            v = v * sigmoidf_(v);   // SiLU
+            y_act_sm[o] = v;
+        }
+    }
+    __syncwarp();
+    float cls_local[1];   // (2+31)/32 = 1
+    matvec_w<C3, 2>(y_act_sm, cfg.head_cls_pred_W, cls_local);
+    if (lane < 2) cls_local[0] += cfg.head_cls_pred_b[lane];
+
+    // ---- REG branch: 96 -> 96 (BN-fused) -> SiLU -> 96 -> {4, 1} ----
+    matvec_w<C3, C3>(in_feat_sm, cfg.head_reg_conv_W, y_pre);
+    #pragma unroll
+    for (int k = 0; k < HEAD_K3; ++k) {
+        const int o = lane + 32 * k;
+        if (o < C3) {
+            float v = y_pre[k] + cfg.head_reg_conv_b[o];
+            v = v * sigmoidf_(v);
+            y_act_sm[o] = v;
+        }
+    }
+    __syncwarp();
+    float reg_local[1];
+    matvec_w<C3, 4>(y_act_sm, cfg.head_reg_pred_W, reg_local);
+    if (lane < 4) reg_local[0] += cfg.head_reg_pred_b[lane];
+    float obj_local[1];
+    matvec_w<C3, 1>(y_act_sm, cfg.head_obj_pred_W, obj_local);
+    if (lane == 0) obj_local[0] += cfg.head_obj_pred_b[0];
+
+    // ---- Write 7 outputs to preds[cell]: [reg(4), obj(1), cls(2)] ----
+    const int hx_local   = s3x - strip.s3_owned_lo;
+    const int hy_local   = s3y - strip.s3_owned_y_lo;
+    const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
+    const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
+    if (hx_local >= 0 && hx_local < s3_owned_w &&
+        hy_local >= 0 && hy_local < s3_owned_h) {
+        const int cell_idx = hy_local * s3_owned_w + hx_local;
+        const long long off = (long long)cell_idx * 7;
+        if (lane < 4)  cfg.preds[blk][off + 0 + lane] = reg_local[0];
+        if (lane == 0) cfg.preds[blk][off + 4]        = obj_local[0];
+        if (lane < 2)  cfg.preds[blk][off + 5 + lane] = cls_local[0];
+        __syncwarp();
+        if (lane == 0) cfg.version[blk][cell_idx] += 1u;
+    }
+}
+
+
 // ---- Drain-N kernel for P1 oracle harness --------------------------------
 //
 // Same interface as ssla_s2_s3_head_w.cuh's drain_n: process up to n0/n1
@@ -1360,38 +1455,48 @@ void k_ssla_s2s3_celled_persistent(
                                   cfg.layers[blk][3], cfg.hidden[blk][3],
                                   contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
-        // ---- Head matvec + predictions write for owner+pass3 events ----
+        // ---- Head + predictions write for owner+pass3 events ------------
         // One warp per event (warp_id < batch_size). event_slots[e].in_feat
-        // currently holds L7 output (C3=96 floats).
+        // holds L7 output (C3=96 floats). Two paths:
+        //   - cfg.head_cls_conv_W != 0 → real 2-layer YOLOX head (trained)
+        //   - cfg.head_W != 0          → legacy single-linear (random/stub)
         constexpr int HEAD_OUT = HEAD_OUT_DEFAULT;
-        if (cfg.head_W != 0 && warp_id < batch_size) {
+        if (warp_id < batch_size &&
+            (cfg.head_cls_conv_W != 0 || cfg.head_W != 0)) {
             const int e = warp_id;
             const bool owner_pass3 = (event_slots[e].is_owner != 0)
                                     && (pass2[e] != 0)
                                     && (pass3[e] != 0);
             if (owner_pass3) {
-                constexpr int HEAD_K = (HEAD_OUT + 31) / 32;
-                float head_local[HEAD_K];
-                matvec_w<C3, HEAD_OUT>(event_slots[e].in_feat,
-                                       cfg.head_W, head_local);
-                if (lane < HEAD_OUT) head_local[0] += cfg.head_b[lane];
-
-                // event_slots[e].evx / evy are in s3 coords already.
                 const int s3x = event_slots[e].evx;
                 const int s3y = event_slots[e].evy;
-                const int hx_local   = s3x - strip.s3_owned_lo;
-                const int hy_local   = s3y - strip.s3_owned_y_lo;
-                const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
-                const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
-                if (hx_local >= 0 && hx_local < s3_owned_w &&
-                    hy_local >= 0 && hy_local < s3_owned_h) {
-                    const int cell_idx = hy_local * s3_owned_w + hx_local;
-                    const long long off = (long long)cell_idx * HEAD_OUT;
-                    if (lane < HEAD_OUT) {
-                        cfg.preds[blk][off + lane] = head_local[0];
+                if (cfg.head_cls_conv_W != 0) {
+                    // Reuse per_warp_qh_sm slot as the 96-float SiLU buffer.
+                    float* y_act_sm = per_warp_qh_sm + warp_id * OUT_MAX;
+                    do_two_layer_head(cfg, blk,
+                                      event_slots[e].in_feat, y_act_sm,
+                                      s3x, s3y, strip);
+                } else {
+                    constexpr int HEAD_K = (HEAD_OUT + 31) / 32;
+                    float head_local[HEAD_K];
+                    matvec_w<C3, HEAD_OUT>(event_slots[e].in_feat,
+                                           cfg.head_W, head_local);
+                    if (lane < HEAD_OUT) head_local[0] += cfg.head_b[lane];
+
+                    const int hx_local   = s3x - strip.s3_owned_lo;
+                    const int hy_local   = s3y - strip.s3_owned_y_lo;
+                    const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
+                    const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
+                    if (hx_local >= 0 && hx_local < s3_owned_w &&
+                        hy_local >= 0 && hy_local < s3_owned_h) {
+                        const int cell_idx = hy_local * s3_owned_w + hx_local;
+                        const long long off = (long long)cell_idx * HEAD_OUT;
+                        if (lane < HEAD_OUT) {
+                            cfg.preds[blk][off + lane] = head_local[0];
+                        }
+                        __syncwarp();
+                        if (lane == 0) cfg.version[blk][cell_idx] += 1u;
                     }
-                    __syncwarp();
-                    if (lane == 0) cfg.version[blk][cell_idx] += 1u;
                 }
             }
         }
@@ -1607,34 +1712,43 @@ void k_ssla_s2s3_celled_persistent_multi(
                                   cfg.layers[blk][3], cfg.hidden[blk][3],
                                   contrib, per_warp_in_feat_sm, per_warp_qh_sm);
 
+        // Head + predictions write — 2-layer trained or legacy single-linear.
         constexpr int HEAD_OUT = HEAD_OUT_DEFAULT;
-        if (cfg.head_W != 0 && warp_id < batch_size) {
+        if (warp_id < batch_size &&
+            (cfg.head_cls_conv_W != 0 || cfg.head_W != 0)) {
             const int e = warp_id;
             const bool owner_pass3 = (event_slots[e].is_owner != 0)
                                     && (pass2[e] != 0)
                                     && (pass3[e] != 0);
             if (owner_pass3) {
-                constexpr int HEAD_K = (HEAD_OUT + 31) / 32;
-                float head_local[HEAD_K];
-                matvec_w<C3, HEAD_OUT>(event_slots[e].in_feat,
-                                       cfg.head_W, head_local);
-                if (lane < HEAD_OUT) head_local[0] += cfg.head_b[lane];
-
                 const int s3x = event_slots[e].evx;
                 const int s3y = event_slots[e].evy;
-                const int hx_local   = s3x - strip.s3_owned_lo;
-                const int hy_local   = s3y - strip.s3_owned_y_lo;
-                const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
-                const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
-                if (hx_local >= 0 && hx_local < s3_owned_w &&
-                    hy_local >= 0 && hy_local < s3_owned_h) {
-                    const int cell_idx = hy_local * s3_owned_w + hx_local;
-                    const long long off = (long long)cell_idx * HEAD_OUT;
-                    if (lane < HEAD_OUT) {
-                        cfg.preds[blk][off + lane] = head_local[0];
+                if (cfg.head_cls_conv_W != 0) {
+                    float* y_act_sm = per_warp_qh_sm + warp_id * OUT_MAX;
+                    do_two_layer_head(cfg, blk,
+                                      event_slots[e].in_feat, y_act_sm,
+                                      s3x, s3y, strip);
+                } else {
+                    constexpr int HEAD_K = (HEAD_OUT + 31) / 32;
+                    float head_local[HEAD_K];
+                    matvec_w<C3, HEAD_OUT>(event_slots[e].in_feat,
+                                           cfg.head_W, head_local);
+                    if (lane < HEAD_OUT) head_local[0] += cfg.head_b[lane];
+
+                    const int hx_local   = s3x - strip.s3_owned_lo;
+                    const int hy_local   = s3y - strip.s3_owned_y_lo;
+                    const int s3_owned_w = strip.s3_owned_hi   - strip.s3_owned_lo;
+                    const int s3_owned_h = strip.s3_owned_y_hi - strip.s3_owned_y_lo;
+                    if (hx_local >= 0 && hx_local < s3_owned_w &&
+                        hy_local >= 0 && hy_local < s3_owned_h) {
+                        const int cell_idx = hy_local * s3_owned_w + hx_local;
+                        const long long off = (long long)cell_idx * HEAD_OUT;
+                        if (lane < HEAD_OUT) {
+                            cfg.preds[blk][off + lane] = head_local[0];
+                        }
+                        __syncwarp();
+                        if (lane == 0) cfg.version[blk][cell_idx] += 1u;
                     }
-                    __syncwarp();
-                    if (lane == 0) cfg.version[blk][cell_idx] += 1u;
                 }
             }
         }

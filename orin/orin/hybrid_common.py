@@ -86,8 +86,21 @@ class CHybridS2S3Config(ctypes.Structure):
         ("hidden",    (ctypes.c_uint64 * 4) * MAX_BLOCKS),
         ("tdrop_s2",  ctypes.c_uint64 * MAX_BLOCKS),
         ("tdrop_s3",  ctypes.c_uint64 * MAX_BLOCKS),
+        # Legacy single-linear head (random / stub path).
         ("head_W",    ctypes.c_uint64),
         ("head_b",    ctypes.c_uint64),
+        # 2-layer YOLOX head (real trained weights path). When
+        # head_cls_conv_W != 0, kernel uses these and ignores head_W/head_b.
+        ("head_cls_conv_W", ctypes.c_uint64),
+        ("head_cls_conv_b", ctypes.c_uint64),
+        ("head_cls_pred_W", ctypes.c_uint64),
+        ("head_cls_pred_b", ctypes.c_uint64),
+        ("head_reg_conv_W", ctypes.c_uint64),
+        ("head_reg_conv_b", ctypes.c_uint64),
+        ("head_reg_pred_W", ctypes.c_uint64),
+        ("head_reg_pred_b", ctypes.c_uint64),
+        ("head_obj_pred_W", ctypes.c_uint64),
+        ("head_obj_pred_b", ctypes.c_uint64),
         ("preds",     ctypes.c_uint64 * MAX_BLOCKS),
         ("version",   ctypes.c_uint64 * MAX_BLOCKS),
         ("timing",       ctypes.c_uint64 * MAX_BLOCKS),
@@ -298,16 +311,102 @@ def alloc_kernel_start_clk():
 
 
 def build_head_weights(rng: np.random.Generator, head_out_dim: int = HEAD_OUT_DEFAULT):
-    """Random-init head weights in managed mem.
+    """Random-init SINGLE-LINEAR head weights in managed mem.
 
     matvec_ct expects W layout (IN, OUT) accessed as W[i*OUT + o], so head_W
-    has shape (C3, head_out_dim) row-major.
+    has shape (C3, head_out_dim) row-major. This path is the legacy stub /
+    random-weights one; for trained weights use load_two_layer_head_weights.
     """
     head_W = rng.normal(scale=0.1, size=(C3, head_out_dim)).astype(np.float32)
     head_b = rng.normal(scale=0.1, size=(head_out_dim,)).astype(np.float32)
     p_W, _, ka_W = alloc_and_fill(head_W)
     p_b, _, ka_b = alloc_and_fill(head_b)
     return p_W, p_b, [ka_W, ka_b]
+
+
+def _fuse_conv_bn(W_conv, b_conv, bn_w, bn_b, bn_mu, bn_var, eps: float = 1e-5):
+    """Fold a 1×1 Conv + BatchNorm (eval mode) into a single 1×1 Conv.
+
+    BN at eval: y = γ·(x-μ)/√(σ²+ε) + β = scale·x + shift
+      scale = γ/√(σ²+ε),  shift = β - scale·μ
+    Composed with the preceding conv (per output channel):
+      W_fused[c_out, c_in] = scale[c_out] · W_conv[c_out, c_in]
+      b_fused[c_out]       = scale[c_out] · b_conv[c_out] + shift[c_out]
+
+    Inputs are PyTorch tensors loaded from npz:
+      W_conv: (C_out, C_in, 1, 1) or (C_out, C_in)
+      b_conv, bn_w, bn_b, bn_mu, bn_var: (C_out,)
+    Returns (W_fused, b_fused) both as (C_out, C_in)/(C_out,) float32.
+    """
+    if W_conv.ndim == 4:
+        W = W_conv.reshape(W_conv.shape[0], W_conv.shape[1])
+    else:
+        W = W_conv
+    scale = bn_w / np.sqrt(bn_var + eps)
+    shift = bn_b - scale * bn_mu
+    W_fused = W * scale[:, None]
+    b_fused = b_conv * scale + shift
+    return W_fused.astype(np.float32), b_fused.astype(np.float32)
+
+
+def load_two_layer_head_weights(npz):
+    """Load YOLOX 2-layer head from a converted weights.npz dict and push
+    each weight to managed memory in (IN, OUT) row-major layout (so the
+    kernel's matvec_w<IN, OUT> reads W[i*OUT + o] coalesced across lanes).
+
+    Schema keys: see tools/make_ssla_stub.py / convert_dsec_ckpt.py.
+
+    Returns (head_ptrs: dict, keepalive: list).
+    """
+    def _get_conv_bias(key: str, C_out: int) -> np.ndarray:
+        # Stub omits Conv2d.bias when bias=False (BN follows immediately).
+        # Trained ckpts keep it (bias=True). Default to zeros if absent.
+        if key in npz.files:
+            return np.asarray(npz[key], dtype=np.float32)
+        return np.zeros((C_out,), dtype=np.float32)
+
+    cls_conv_W, cls_conv_b = _fuse_conv_bn(
+        npz["head/cls_convs/0/0/weight"],
+        _get_conv_bias("head/cls_convs/0/0/bias", C3),
+        npz["head/cls_convs/0/1/weight"], npz["head/cls_convs/0/1/bias"],
+        npz["head/cls_convs/0/1/running_mean"], npz["head/cls_convs/0/1/running_var"])
+    reg_conv_W, reg_conv_b = _fuse_conv_bn(
+        npz["head/reg_convs/0/0/weight"],
+        _get_conv_bias("head/reg_convs/0/0/bias", C3),
+        npz["head/reg_convs/0/1/weight"], npz["head/reg_convs/0/1/bias"],
+        npz["head/reg_convs/0/1/running_mean"], npz["head/reg_convs/0/1/running_var"])
+    # cls_pred (2, C3), reg_pred (4, C3), obj_pred (1, C3) — PyTorch (out, in).
+    cls_pred_W = npz["head/cls_preds/0/weight"].reshape(2, C3).astype(np.float32)
+    cls_pred_b = npz["head/cls_preds/0/bias"].astype(np.float32)
+    reg_pred_W = npz["head/reg_preds/0/weight"].reshape(4, C3).astype(np.float32)
+    reg_pred_b = npz["head/reg_preds/0/bias"].astype(np.float32)
+    obj_pred_W = npz["head/obj_preds/0/weight"].reshape(1, C3).astype(np.float32)
+    obj_pred_b = npz["head/obj_preds/0/bias"].astype(np.float32)
+
+    def _to_in_out(W_out_in):
+        """matvec_w wants W stored (IN, OUT) row-major, accessed as W[i*OUT+o].
+        PyTorch conv weights come as (OUT, IN) → transpose."""
+        return np.ascontiguousarray(W_out_in.T).astype(np.float32)
+
+    p_cls_W,  _, ka1  = alloc_and_fill(_to_in_out(cls_conv_W))
+    p_cls_b,  _, ka2  = alloc_and_fill(cls_conv_b)
+    p_clsp_W, _, ka3  = alloc_and_fill(_to_in_out(cls_pred_W))
+    p_clsp_b, _, ka4  = alloc_and_fill(cls_pred_b)
+    p_reg_W,  _, ka5  = alloc_and_fill(_to_in_out(reg_conv_W))
+    p_reg_b,  _, ka6  = alloc_and_fill(reg_conv_b)
+    p_regp_W, _, ka7  = alloc_and_fill(_to_in_out(reg_pred_W))
+    p_regp_b, _, ka8  = alloc_and_fill(reg_pred_b)
+    p_objp_W, _, ka9  = alloc_and_fill(_to_in_out(obj_pred_W))
+    p_objp_b, _, ka10 = alloc_and_fill(obj_pred_b)
+
+    head_ptrs = {
+        "cls_conv_W": p_cls_W,  "cls_conv_b": p_cls_b,
+        "cls_pred_W": p_clsp_W, "cls_pred_b": p_clsp_b,
+        "reg_conv_W": p_reg_W,  "reg_conv_b": p_reg_b,
+        "reg_pred_W": p_regp_W, "reg_pred_b": p_regp_b,
+        "obj_pred_W": p_objp_W, "obj_pred_b": p_objp_b,
+    }
+    return head_ptrs, [ka1, ka2, ka3, ka4, ka5, ka6, ka7, ka8, ka9, ka10]
 
 
 def alloc_predictions(H3: int, W2: int, head_out_dim: int = HEAD_OUT_DEFAULT):
