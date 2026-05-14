@@ -4,62 +4,67 @@
 
 Streams events from a DVS camera (iniVation DVXplorer / DVXplorer Micro)
 through a 4-stage SSLA-S backbone + YOLOX detection head, end-to-end,
-without batching. Targets the NVIDIA Jetson Orin NX as the reference
-platform.
+without batching. Reference platform: **NVIDIA Jetson Orin NX**.
 
-Originally a subtree of [OpenEVA](https://github.com/...) — split out
-because the deploy concerns (latency, hardware coherence, persistent
-CUDA kernels) move on a different cadence from the research benchmark.
-
----
-
-## Headline numbers
-
-Measured on Jetson Orin NX (MAXN, 8 SM Ampere @ 918 MHz) at 64 × 80
-post-subsample resolution. 2-block GPU sharding with the cell-owner warp
-kernel; CPU side at 4 shards halo=2 (lib_stage01_to_gpu).
-
-| metric | block-coop (legacy) | **ssla-rt celled** | speedup |
-|---|---:|---:|---:|
-| GPU drain (saturation) | 5 kev/s | **45 kev/s** | **9.0×** |
-| GPU owner-pass-3 p50 | 530 µs | **127 µs** | **4.2×** |
-| GPU owner-pass-3 p99 | 1.8 ms | **310 µs** | **5.8×** |
-| End-to-end admit ceiling | 0.07 Mev/s | **~0.6 Mev/s** | **8.6×** |
-| Drift vs CPU oracle (drop count) | 0 (with risk) | **0** (race-free by design) | — |
-| Drift vs CPU oracle (max\|Δ\|) | 4.40 | 4.40 | matches |
-
-The system bottleneck moved from GPU (`block-coop` was drain-limited) to
-CPU side admit. See [docs/architecture.md](docs/architecture.md) for
-the design rationale and [orin/STATUS.md](orin/STATUS.md) §§6–7 for the
-full measurement log.
+Originally a subtree of [OpenEVA](https://github.com/openeva-dev) —
+split out because the deploy concerns (latency, hardware coherence,
+persistent CUDA kernels) move on a different cadence from the research
+benchmark.
 
 ---
 
-## Architecture
+## Headline numbers (2026-05-14, session-end)
+
+Measured on Jetson Orin NX (MAXN, 8 SMs Ampere @ 918 MHz) at 80×64
+post-subsample resolution. 8 GPU blocks (2W × 4H balanced topology) with
+the cell-owner warp kernel; 6 CPU shards (halo=2).
+
+| metric | value | notes |
+|---|---:|---|
+| **GPU drain (live, saturated)** | **~230 kev/s** | output-producing events |
+| GPU drain (offline benchmark) | ~247 kev/s | pre-filled rings |
+| **End-to-end latency p50** | **~330 µs** | emit → GPU prediction write |
+| End-to-end latency p99 | ~1.6 ms | OS/IRQ-dominated tail |
+| End-to-end latency max | ~2.3 ms | |
+| CPU admit ceiling | ~2.80 Mev/s | post commit `d876030` |
+| P1 oracle (drop drift) | 0 | bit-identical hidden state |
+| P1 oracle (max\|Δ\| s3_feat) | 4.2 (≤ 5.0 budget) | passing |
+
+See [`docs/PROFILE.md`](docs/PROFILE.md) for the full per-phase
+breakdown, throughput sweep, and saturation analysis. See
+[`docs/PIPELINE_DESIGN.md`](docs/PIPELINE_DESIGN.md) for the
+architecture, constraints, and what's been tried (including dead
+ends — kept for context).
+
+---
+
+## Architecture (one screen)
 
 ```
-DVXplorer ──► dv_processing ──► libstage01_to_gpu.so ──► pinned MPSC ring ──► persistent CUDA kernel
-                                │ 4 CPU shards          │ ×2 (one per          │ 2 blocks × 9 cell-
-                                │ halo = 2              │   GPU block)         │ owner warps each,
-                                │ stages s0 + s1        │                      │ stages s2 + s3 + head
-                                │                       │                      │ race-free by partition
+DVXplorer ── dv-processing ── libstage01_to_gpu.so ── pinned ring × 8 ── persistent CUDA kernel
+                              │ 6 CPU shards          │ 1 ring per         │ 8 blocks × 9 cell-
+                              │ halo=2 spatial        │   GPU block        │ owner warps
+                              │ stages s0 + s1        │ SPSC, pinned host  │ stages s2 + s3 + head
+                              │ (NEON-optimised)      │   memory           │ race-free by design
 ```
 
-Key design properties:
+**Key properties:**
 
-* **CPU shards** run s0 + s1 with halo-=-2 spatial sharding. Owner-pass
-  events get pushed to per-GPU-block pinned rings via lock-free MPSC.
-* **GPU side** runs 2 blocks × 9 warps each. Hidden state cells are
-  partitioned by `warp_id = (cy % 3) * 3 + (cx % 3)`. Any event's 3×3
-  patch update writes to 9 cells, each owned by a different warp →
-  no within-block race on hidden state OR tdrop counters, by construction.
-* **Per-batch gather** sums 9 per-warp contributions into each event's
-  out_feat (lane-striped warp-shuffle reduction).
-* **No GPU atomics, no `__syncthreads` inside the per-event step** —
-  only `__syncwarp` and per-batch barriers.
-* **Tegra-coherence-safe**: rings + control flags use pinned host memory
-  (`cuMemHostAlloc`); hidden state + weights use managed memory with no
-  concurrent CPU/GPU writes.
+- **CPU shards** run s0 + s1 with halo=2 spatial sharding (each shard
+  owns a horizontal s2 strip with 2-cell halo overlap). NEON
+  fused-interior kernels carry the matvec work.
+- **GPU side** runs 8 blocks × 9 warps each on the 8 SMs. Hidden state
+  cells are partitioned by `warp_id = (cy % 3) * 3 + (cx % 3)`. Any
+  event's 3×3 patch touches 9 cells with 9 distinct owners → no
+  within-block race, no atomics needed.
+- **Per-batch gather** sums 9 per-warp contributions for each event via
+  warp-shuffle reduction in shared memory.
+- **No GPU atomics, no `__syncthreads` inside per-event step** — only
+  `__syncwarp` and per-batch barriers between phases.
+- **Tegra-coherence-safe**: rings, head/tail atomics, and stop flags
+  use **pinned host memory** (`cuMemHostAlloc`). Hidden state and
+  weights use managed memory but are GPU-only-write at runtime
+  (`CONCURRENT_MANAGED_ACCESS = 0` on this device).
 
 ---
 
@@ -67,12 +72,13 @@ Key design properties:
 
 ### Requirements
 
-* NVIDIA Jetson Orin NX (or compatible Ampere) running JetPack 5+
-* CUDA toolkit ≥ 11.4, `pip install cuda-python`
-* GCC 9.4+, CMake 3.16+
-* numpy
-* (optional, for live camera) `dv-processing` 1.7+ with the
-  DVXplorer Micro driver
+- NVIDIA Jetson Orin NX (or compatible Ampere `sm_87`) on JetPack 5+
+- CUDA toolkit ≥ 11.4, `pip install cuda-python`
+- GCC 9.4+, CMake 3.16+
+- numpy
+- (optional, live camera) `dv-processing` 2.0+ with the DVXplorer
+  Micro driver (libcaer 3.3.17 does NOT work for Micro — use
+  dv-processing)
 
 ### Build
 
@@ -83,47 +89,100 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-This produces three shared libraries under `build/`:
+Produces three shared libs under `build/`:
+- `libstage01_to_gpu.so` — production hybrid pipeline (used by
+  `orin/hybrid_runner*.py`)
+- `libstage01_capi.so` — CPU-only baseline (stages s0 + s1)
+- `libstage0_capi.so` — stage-0-only baseline
 
-* `libstage01_to_gpu.so` — the production hybrid pipeline (used by `orin/hybrid_runner.py`)
-* `libstage01_capi.so` — CPU-only baseline (stages s0 + s1)
-* `libstage0_capi.so` — stage-0-only baseline
+Plus `oracle_diff` static helper.
 
-To also build the historical CPU-sharding scheme binaries (S2..S8),
-configure with `-DSSLA_RT_BUILD_SCHEMES=ON`. Note: these expect x86-64
-intrinsics and may not compile on aarch64 without patches.
+> To also build the 11 historical x86 CPU-sharding scheme binaries
+> (s_stage0_*, s1..s8), configure with `-DSSLA_RT_BUILD_SCHEMES=ON`.
+> These won't compile on aarch64 without patches — they were used in
+> the early CPU optimization log and are kept for reference.
 
-### Run with stub weights (no training needed)
+### Generate stub weights (no training needed)
 
-For benchmarking / smoke testing, generate random-init SSLA-S weights
-that satisfy the C++ loader's schema:
+For benchmarks / smoke testing, generate schema-valid random weights:
 
 ```bash
 python3 tools/make_ssla_stub.py /tmp/ssla_s_64x80/ --h 64 --w 80
 ```
 
-Then run the hybrid pipeline with the cell-owner GPU kernel:
+`/tmp` is volatile on Orin — regenerate after reboot.
+
+### Run
+
+The Python runners live in `orin/`. **Run from inside `orin/`** so the
+`orin/orin/` Python package is on `sys.path`:
 
 ```bash
 cd orin
+
+# === P1 correctness oracle (offline) ===
+# Compares GPU drain_n output to a CPU oracle, prints drop drift +
+# max|Δ| of s3_feat. Must pass before any other change is shipped.
+python3 bench_s2_s3_head_celled.py --n 50000
+# expect: drop drift = 0, max|Δ| ≤ 5.0
+
+# === Offline throughput (N-block) ===
+# Sweep multi-block GPU drain — no live ring, no CPU side.
+python3 perf_celled_multi.py --n-blocks 8 --n 200000 --runs 3
+
+# === Offline per-phase µs profile ===
+python3 perf_celled_profile.py --n 50000
+
+# === Live throughput + latency (8-block production) ===
+python3 hybrid_runner_multi.py \
+    --weights /tmp/ssla_s_64x80/ \
+    --gpu-blocks 8 --shards 6 --cpp-synth \
+    --synthetic-mev 2.0 --duration-s 8 \
+    --pin-python-main --base-core 1
+# Reports drain rate per block + end-to-end latency for
+# output-producing events.
+
+# === Live 2-block (legacy runner, also production-tested) ===
 python3 hybrid_runner.py \
     --weights /tmp/ssla_s_64x80/ \
-    --kernel-variant celled \
-    --synthetic-mev 0.5 \
-    --duration-s 10
+    --cpp-synth --synthetic-mev 2.0 \
+    --duration-s 10 --pin-python-main
+
+# === Live camera (real DVXplorer Micro) ===
+# Drop --synthetic-mev to use camera events.
+python3 hybrid_runner_multi.py \
+    --weights /tmp/ssla_s_64x80/ \
+    --gpu-blocks 8 --shards 6 --duration-s 30 \
+    --pin-python-main --base-core 1
 ```
 
-Expected output: `P2 PASS — both blocks advanced and wrote non-zero
-predictions; no ring deadlock.` plus a GPU latency table.
+### Live event viewer + DVXplorer tuner
 
-### Run with trained weights (real predictions)
+```bash
+cd orin/viz
+python3 event_viewer.py                           # GUI with trackbars
+python3 event_viewer.py --motion-probe            # sweep thresholds under
+                                                  # continuous motion
+python3 event_viewer.py --probe-thresholds        # static threshold sweep
+python3 event_viewer.py --list-methods            # dump camera API
+```
 
-Export weights via OpenEVA's `python/exporter.py` from a trained SSLA-S
-checkpoint. The export schema is documented in
-[orin/STATUS.md](orin/STATUS.md). Replace the `--weights` path above.
+Note: DVXplorer contrast threshold valid range is **0–17** (chip clamps
+silently above that). The trackbar caps at 17 since commit `93a843b`.
 
-For live camera input (drop `--synthetic-mev`), connect a DVXplorer USB
-camera and run `hybrid_runner.py` with `--duration-s 30`.
+### Tests
+
+```bash
+# Python unit tests (proto_layer_pair primitive, weights, ring SPSC):
+cd orin
+python3 -m pytest tests/ -v
+
+# C++ benches:
+./build/bench_fused
+./build/bench_layer
+./build/bench_matvec24
+./build/bench_sigmoid
+```
 
 ---
 
@@ -131,51 +190,90 @@ camera and run `hybrid_runner.py` with `--duration-s 30`.
 
 ```
 ssla-rt/
-├── CMakeLists.txt           standalone build, no parent dependency
-├── include/                 public C/C++ headers (ssla_kernels.h, lat_stats.h, ...)
-├── src/                     CPU pipeline sources (lib_stage01_to_gpu.cpp, ssla_kernels.cpp, ...)
-├── orin/
-│   ├── hybrid_runner.py     production end-to-end driver
-│   ├── bench_*.py           offline drain_n harnesses + P1 oracles
-│   ├── kernels/             CUDA source (ssla_s2_s3_head_celled.cuh + primitives)
-│   ├── orin/                Python utility package (cuda_util, nvrtc_util, hybrid_common)
-│   ├── tests/               unit tests
-│   ├── viz/                 live event-viewer (oscilloscope + controls)
-│   ├── STATUS.md            full measurement log (§§1–7)
-│   └── HYBRID_DESIGN.md     design doc for the CPU/GPU split
-├── tools/
-│   └── make_ssla_stub.py    schema-valid random-weight export generator
-├── vendor/                  vendored OpenEVA pieces (event, prim/, heads/, weights_loader)
-└── docs/
-    └── DEV_LOG.md           historical PoC dev log (predates the celled rewrite)
+├── CLAUDE.md / README.md / LICENSE / CMakeLists.txt
+├── include/                  public C/C++ headers
+├── src/                      CPU pipeline (production)
+│   ├── lib_stage01_to_gpu.cpp   hybrid CPU s0+s1 → ring → GPU
+│   ├── lib_stage{0,01}_capi.cpp CPU-only baselines
+│   ├── ssla_kernels.cpp         NEON-optimised forward kernels
+│   ├── oracle_diff.cpp          P1 oracle diff helper
+│   ├── multicore_bench.cpp      CPU multicore bench
+│   └── legacy/schemes/          11 historical x86 schemes (opt-in build)
+├── tests/                    C++ benches (bench_fused, bench_layer, ...)
+├── tools/make_ssla_stub.py   schema-valid random-weight generator
+├── scripts/run_scaling.sh    helper for throughput scan
+├── vendor/                   vendored openeva (event, prim, heads, weights_loader)
+├── docs/
+│   ├── PIPELINE_DESIGN.md       current architecture + constraints
+│   ├── PROFILE.md               current measurement snapshot
+│   ├── DEV_LOG.md               historical dev log
+│   └── archive/                 superseded docs (STATUS, HYBRID_DESIGN, ...)
+└── orin/                     Python + GPU side
+    ├── orin/                    Python utility package (cuda_util, nvrtc_util,
+    │                            hybrid_common, multi_block, weights_ssla, ssla_ref)
+    ├── kernels/
+    │   ├── ssla_s2_s3_head_celled.cuh           PRODUCTION kernel
+    │   ├── ssla_s2_s3_head_celled_profile.cuh   profile variant
+    │   ├── proto_layer_pair.cuh                 warp-cooperative primitives
+    │   └── legacy/                              6 superseded kernels
+    ├── tests/                                   unit tests
+    ├── viz/event_viewer.py                      live event viewer + tuner
+    ├── hybrid_runner.py                         2-block live runner
+    ├── hybrid_runner_multi.py                   N-block live runner (production)
+    ├── bench_s2_s3_head_celled.py               P1 oracle
+    ├── perf_celled.py / perf_celled_multi.py    offline throughput
+    ├── perf_celled_profile.py                   per-phase µs profile
+    ├── analyze_coalescing.py                    offline reuse-statistics analyzer
+    └── legacy/                                  superseded scripts + tests
 ```
 
 ---
 
-## Status
+## What's been tried and the bottom line
 
-| Phase | Result |
-|---|---|
-| P1 — kernel correctness vs CPU oracle (200 k events offline) | ✅ PASS (drift 0, max\|Δ\| 4.40) |
-| P2 — live synthetic 10 s | ✅ PASS (ring lag 0, all 80/80 cells written) |
-| P3 — saturation sweep (0.05/0.5/1.0/2.0 Mev/s synthetic) | ✅ PASS (CPU caps at 0.6 Mev/s admit) |
-| Live camera (DVXplorer Micro) | ✅ PASS at low admit; high-rate scene TBD |
+See [`docs/PIPELINE_DESIGN.md`](docs/PIPELINE_DESIGN.md) §§ 9–10 for
+the full list. Briefly:
 
-See [orin/STATUS.md](orin/STATUS.md) §§6–7 for the full measurement
-tables and tail-latency distributions.
+**Shipped optimizations (cumulative on this session's branch):**
 
-### Known limitations / next steps
+- L4 qvgIn smem cache (121 KB persistent in smem, avoids per-batch L2 reload)
+- L7 qvgIn L2 persistence (`CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW`,
+  perf benches only)
+- Balanced H-strip topology (5/3/3/5 owned Y instead of 4/4/4/4 —
+  equalizes proc-width across corner and middle blocks)
+- VG-only state-only patch (events failing tdrop skip the Q half of the
+  qvg matvec — 75% of L5/L7 events benefit)
 
-1. **CPU s0+s1 is now the bottleneck.** End-to-end admit hard-caps at
-   ~0.6 Mev/s (4 shards × halo=2 throughput). Going past that requires
-   CPU-side work: more shards, SIMD-vectorized matvecs, or halo-overhead
-   reduction.
-2. **Single block per SM** on the GPU side. SMEM (~41 KB) is the limit;
-   halving BATCH from 8 to 4 would enable 2 blocks/SM → another
-   ~1.5–2× GPU drain ceiling.
-3. **Camera knobs not auto-tuned.** The DVXplorer's `contrastThreshold`
-   and `MIPITimeoutValue` control admit rate; `orin/viz/event_viewer.py`
-   is the manual exploration UI.
+**Experiments that didn't pay off (reverted):**
+
+- Pipeline split / 2 blocks/SM via `__launch_bounds__(_, 2)`: compute
+  contention swallowed the occupancy win (1.1×, not 2×)
+- 16-block topology: same contention
+- TF32 Tensor Core L4 qvg precompute: m=1 / m=8 padding kills TC
+  efficiency on our problem size (-5 % net)
+- Batch-local hidden-cell coalescing: reuse only 1.097 on uniform synth,
+  overhead 700× the savings (-6 %)
+
+**Hard constraints (do not violate without project sign-off):**
+
+- `halo = 2` is locked
+- Cell-owner warp partition (race-free invariant)
+- Pinned host memory for ring traffic (Tegra coherence)
+- No fp16, no int8
+- `BATCH = 8`
+
+---
+
+## Known limitations / open work
+
+1. **GPU is the live bottleneck.** CPU at 2.80 Mev/s admit produces
+   more GPU events than the GPU's 230 kev/s drain can absorb at full
+   halo replication. Backlog accumulates at saturation.
+2. **p99 tail latency (~1.6 ms) is OS / DRAM-burst dominated.** Going
+   below ~500 µs would need root + SCHED_FIFO + memory locking — out
+   of scope under no-root.
+3. **DVXplorer contrast threshold caps at 17** chip-side. See memory
+   `project_dvxplorer_contrast_range.md` and commit `93a843b`.
 
 ---
 
@@ -191,24 +289,11 @@ consistency with this redistribution.
 
 ## Citing
 
-If this work is useful, please cite:
-
 ```
 @software{ssla-rt,
   title  = {ssla-rt: Real-time SSLA-S inference runtime for edge devices},
   author = {Hao, Haoqiang},
   year   = {2026},
   url    = {https://github.com/haohq19/ssla-rt},
-}
-```
-
-And the underlying SSLA paper:
-
-```
-@article{ssla2024,
-  title  = {SSLA: ...},
-  author = {Hao et al.},
-  year   = {2024},
-  url    = {https://arxiv.org/abs/2603.06228},
 }
 ```

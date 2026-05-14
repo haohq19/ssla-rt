@@ -101,14 +101,15 @@ set_target_properties(stage01_to_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # (x86-64) — some use `__builtin_ia32_pause` directly and won't compile on
 # aarch64 without conditional patches. Opt-in via `-DSSLA_RT_BUILD_SCHEMES=ON`.
 # The production path is the SHARED libs above + the Python runtime in orin/;
-# the schemes are not needed for normal use.
+# the schemes are not needed for normal use. Sources moved to src/legacy/
+# schemes/ to keep src/ focused on production code.
 option(SSLA_RT_BUILD_SCHEMES "Build historical CPU sharding scheme binaries" OFF)
 if(SSLA_RT_BUILD_SCHEMES)
   foreach(scheme
       s2_decomp_st s_stage0_only s_stage0_multicore s2_pipeline s3_sharded
       s4_owner_shard s5_locked s6_full_locked s7_replicated s8_hierarchical)
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/${scheme}.cpp)
-      add_executable(${scheme} src/${scheme}.cpp)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/legacy/schemes/${scheme}.cpp)
+      add_executable(${scheme} src/legacy/schemes/${scheme}.cpp)
       target_link_libraries(${scheme} PRIVATE ssla_kernels openeva_vendor Threads::Threads)
     endif()
   endforeach()

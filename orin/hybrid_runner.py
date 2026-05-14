@@ -255,10 +255,13 @@ def main() -> int:
     ap.add_argument("--synthetic-mev", type=float, default=0.0,
                     help="If > 0, skip camera and feed synthetic events at "
                          "this rate (Mev/s) for saturation testing.")
-    ap.add_argument("--kernel-variant", type=str, default="coop",
-                    choices=["coop", "celled"],
-                    help="coop = block-cooperative (ssla_s2_s3_head.cuh); "
-                         "celled = cell-owner warps (ssla_s2_s3_head_celled.cuh)")
+    # `--kernel-variant` kept for backward compat with shell scripts that
+    # pass `celled`; the legacy `coop` variant has been removed (see
+    # docs/archive/HYBRID_DESIGN.md for the old block-cooperative kernel).
+    ap.add_argument("--kernel-variant", type=str, default="celled",
+                    choices=["celled"],
+                    help="celled = cell-owner warps (ssla_s2_s3_head_celled.cuh). "
+                         "Only option; flag kept for script compatibility.")
     args = ap.parse_args()
 
     # Pin the Python main thread (+ inherited by cam_thread and stats poller)
@@ -329,40 +332,31 @@ def main() -> int:
     ctypes.memset(stop_flag, 0, 4)
 
     # ---- 3. Compile + launch persistent kernel ------------------------
-    if args.kernel_variant == "coop":
-        src   = open(os.path.join(KERNELS_DIR, "ssla_s2_s3_head.cuh")).read()
-        prim  = open(os.path.join(KERNELS_DIR, "ssla_primitives.cuh")).read()
-        layer = open(os.path.join(KERNELS_DIR, "ssla_layer.cuh")).read()
-        headers = {"ssla_primitives.cuh": prim, "ssla_layer.cuh": layer}
-        mod_name   = "ssla_s2_s3_head.cu"
-        func_name  = "k_ssla_s2s3_persistent"
-        threads_pb = 256
-        SMEM       = (C1 + 2 * C3 + 5 * C3) * 4    # 2784 B
-    else:  # celled
-        src   = open(os.path.join(KERNELS_DIR, "ssla_s2_s3_head_celled.cuh")).read()
-        proto = open(os.path.join(KERNELS_DIR, "proto_layer_pair.cuh")).read()
-        headers = {"proto_layer_pair.cuh": proto}
-        mod_name   = "ssla_s2_s3_head_celled.cu"
-        func_name  = "k_ssla_s2s3_celled_persistent"
-        threads_pb = 9 * 32    # = 288 (9 cell-owner warps)
-        # SMEM layout must match bench_s2_s3_head_celled.py::_smem_size_bytes
-        BATCH_K = 8
-        N_WARPS_K = 9
-        OUT_MAX_K = C3
-        C1_K, C2_K = 24, 48
-        event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
-        SMEM = (event_slot * BATCH_K
-                + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
-                + N_WARPS_K * OUT_MAX_K * 4
-                + N_WARPS_K * OUT_MAX_K * 4
-                + N_WARPS_K * BATCH_K * 4
-                + N_WARPS_K * BATCH_K * 4
-                + N_WARPS_K * 4
-                + BATCH_K * 4
-                + BATCH_K * 4
-                + 9 * 3 * C2_K * C1_K * 4)   # L4 qvgIn smem cache (121 KB)
-        SMEM = ((SMEM + 15) // 16) * 16
-    print(f"Compiling {args.kernel_variant} kernel ...", flush=True)
+    # Cell-owner warp kernel (production). SMEM layout must match
+    # bench_s2_s3_head_celled.py::_smem_size_bytes.
+    src   = open(os.path.join(KERNELS_DIR, "ssla_s2_s3_head_celled.cuh")).read()
+    proto = open(os.path.join(KERNELS_DIR, "proto_layer_pair.cuh")).read()
+    headers = {"proto_layer_pair.cuh": proto}
+    mod_name   = "ssla_s2_s3_head_celled.cu"
+    func_name  = "k_ssla_s2s3_celled_persistent"
+    threads_pb = 9 * 32    # = 288 (9 cell-owner warps)
+    BATCH_K = 8
+    N_WARPS_K = 9
+    OUT_MAX_K = C3
+    C1_K, C2_K = 24, 48
+    event_slot = OUT_MAX_K * 4 + OUT_MAX_K * 4 + 5 * 4 + 4 + 8 + 8  # 5 ints + pad + 2 u64 (t_push_ns, t_emit_ns)
+    SMEM = (event_slot * BATCH_K
+            + BATCH_K * N_WARPS_K * OUT_MAX_K * 4
+            + N_WARPS_K * OUT_MAX_K * 4
+            + N_WARPS_K * OUT_MAX_K * 4
+            + N_WARPS_K * BATCH_K * 4
+            + N_WARPS_K * BATCH_K * 4
+            + N_WARPS_K * 4
+            + BATCH_K * 4
+            + BATCH_K * 4
+            + 9 * 3 * C2_K * C1_K * 4)   # L4 qvgIn smem cache (121 KB)
+    SMEM = ((SMEM + 15) // 16) * 16
+    print(f"Compiling celled kernel ...", flush=True)
     t0 = time.monotonic()
     mod = CudaModule(src, name=mod_name, headers=headers)
     print(f"  cache {mod.cache_status} in {time.monotonic()-t0:.1f}s", flush=True)

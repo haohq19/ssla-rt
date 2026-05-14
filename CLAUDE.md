@@ -29,41 +29,57 @@ Reference platform: **NVIDIA Jetson Orin NX**.
 
 ```
 ssla-rt/
-├── CMakeLists.txt         standalone build, no parent repo dependency
-├── include/               public C/C++ headers (ssla_kernels.h, spsc.h, lat_stats.h, ...)
-├── src/                   CPU pipeline sources
-│   ├── lib_stage01_to_gpu.cpp   the production hybrid pipeline (CPU s0+s1 → pinned ring → GPU)
-│   ├── lib_stage01_capi.cpp     CPU-only stages s0+s1
-│   ├── lib_stage0_capi.cpp      CPU-only stage 0
-│   ├── ssla_kernels.cpp         per-stage SSLA-S forward kernels
-│   └── s*.cpp                   historical scheme experiments (opt-in build)
-├── orin/
-│   ├── hybrid_runner.py         production end-to-end driver (--kernel-variant celled)
-│   ├── bench_s2_s3_head_celled.py     P1 oracle harness for celled GPU kernel
-│   ├── bench_s2_s3_head.py            P1 oracle for legacy block-coop kernel
-│   ├── bench_s2_s3_head_w.py          P1 oracle for warp-per-event (deprecated, races)
-│   ├── kernels/
-│   │   ├── ssla_s2_s3_head_celled.cuh   PRODUCTION GPU kernel (cell-owner warps)
-│   │   ├── ssla_s2_s3_head.cuh          legacy block-coop kernel
-│   │   ├── ssla_s2_s3_head_w.cuh        warp-per-event kernel (deprecated; has races)
-│   │   ├── proto_layer_pair.cuh         warp-cooperative layer primitives
-│   │   ├── ssla_primitives.cuh, ssla_layer.cuh   block-coop primitives
-│   │   └── ssla_step.cuh                full-pipeline persistent kernel proto
-│   ├── orin/                     Python utility package
-│   │   ├── cuda_util.py          cuMemHostAlloc, cuMemAllocManaged wrappers
-│   │   ├── nvrtc_util.py         NVRTC compile + PTX cache by hash + CudaModule
-│   │   ├── hybrid_common.py      ctypes mirrors of HybridS2S3Config etc.
-│   │   ├── weights_ssla.py       reshape qvgIn / goW for matvec-friendly layout
-│   │   └── ssla_ref.py           single-thread CPU oracle (LayerRef, layer_step)
-│   ├── tests/                    unit tests (test_proto_layer_pair.py, ...)
-│   ├── viz/                      live event-viewer (oscilloscope + DVXplorer controls)
-│   ├── STATUS.md                 full measurement log §§1–7 (READ THIS FIRST)
-│   └── HYBRID_DESIGN.md          design doc for the CPU/GPU split
+├── CLAUDE.md / README.md / LICENSE / CMakeLists.txt / .gitignore
+├── include/                    public C/C++ headers (ssla_kernels.h, spsc.h, ...)
+├── src/                        production CPU pipeline sources
+│   ├── lib_stage01_to_gpu.cpp     production hybrid pipeline (CPU s0+s1 → ring → GPU)
+│   ├── lib_stage01_capi.cpp       CPU-only stages s0+s1
+│   ├── lib_stage0_capi.cpp        CPU-only stage 0
+│   ├── ssla_kernels.cpp           per-stage SSLA-S forward kernels (NEON-optimised)
+│   ├── oracle_diff.cpp / multicore_bench.cpp   benches
+│   └── legacy/schemes/             11 historical x86 CPU sharding scheme experiments
+│                                   (opt-in build via -DSSLA_RT_BUILD_SCHEMES=ON;
+│                                    x86-only, won't compile on aarch64)
+├── tests/                      C++ benches (bench_fused, bench_layer, bench_matvec*, bench_sigmoid)
 ├── tools/
-│   └── make_ssla_stub.py         schema-valid random-weight export generator
-├── vendor/                       vendored openeva pieces (event, prim/, heads/, weights_loader)
-└── docs/
-    └── DEV_LOG.md                historical PoC dev log (predates the celled rewrite)
+│   └── make_ssla_stub.py          schema-valid random-weight export generator
+├── scripts/
+│   └── run_scaling.sh             throughput scan helper
+├── vendor/                     vendored openeva pieces (event, prim/, heads/, weights_loader)
+├── docs/
+│   ├── PIPELINE_DESIGN.md         CURRENT canonical architecture + constraints
+│   ├── PROFILE.md                 CURRENT measured throughput + latency snapshot
+│   ├── DEV_LOG.md                 historical PoC dev log
+│   └── archive/                   superseded design docs (STATUS, HYBRID_DESIGN,
+│                                   RISK_RETIREMENT, CPU_PERF_STATUS) — kept for
+│                                   context but not maintained
+└── orin/                       Python + GPU side
+    ├── README.md                  orin-specific quickstart
+    ├── orin/                      Python utility package
+    │   ├── cuda_util.py             cuMemHostAlloc, cuMemAllocManaged wrappers
+    │   ├── nvrtc_util.py            NVRTC compile + PTX cache + CudaModule
+    │   ├── hybrid_common.py         ctypes mirrors of HybridS2S3Config etc.
+    │   ├── multi_block.py           topology + per-block resource allocation
+    │   ├── weights_ssla.py          reshape qvgIn / goW for matvec-friendly layout
+    │   ├── weights.py               npz-to-managed-memory loader
+    │   └── ssla_ref.py              single-thread CPU oracle (LayerRef, layer_step)
+    ├── kernels/
+    │   ├── ssla_s2_s3_head_celled.cuh         PRODUCTION GPU kernel
+    │   ├── ssla_s2_s3_head_celled_profile.cuh per-phase profile variant
+    │   ├── proto_layer_pair.cuh               warp-cooperative primitives
+    │   └── legacy/                            6 superseded kernels (block-coop,
+    │                                          warp-per-event with races, etc.)
+    ├── tests/                      unit tests (proto_layer_pair, weights, ring)
+    ├── viz/event_viewer.py         live event viewer + DVXplorer tuning tool
+    ├── hybrid_runner.py            2-block production live runner
+    ├── hybrid_runner_multi.py      N-block (2/4/8) production live runner
+    ├── bench_s2_s3_head_celled.py  P1 oracle (CPU reference vs GPU drain_n)
+    ├── perf_celled.py              offline throughput (2 block)
+    ├── perf_celled_multi.py        offline throughput (N block)
+    ├── perf_celled_profile.py      per-phase µs profile
+    ├── analyze_coalescing.py       offline batch-local hidden-cell reuse analyzer
+    └── legacy/                     superseded benches / demos / one-off scripts
+        └── tests/                  tests for legacy kernels (not maintained)
 ```
 
 ## 2. Critical invariants
@@ -179,9 +195,10 @@ python3 bench_s2_s3_head_celled.py --n 200000
 | P2 | Live 30 s synthetic at 0.05 Mev/s | no deadlock, both blocks write 40/40 cells |
 | P3 | Saturation sweep 0.05/0.5/1.0/2.0 Mev/s | ring lag bounded; document drain ceiling |
 
-See `orin/STATUS.md` §§6–7 for current passing numbers.
+See `docs/PROFILE.md` for current passing numbers (throughput + latency
+sweep). Historical measurement log: `docs/archive/STATUS.md` §§6–7.
 
-## 6. Headline measurements (as of 2026-05-12; see STATUS.md §10 for Phase 3 fused interior layers — supersedes §9)
+## 6. Headline measurements (current snapshot lives in `docs/PROFILE.md`; full historical log in `docs/archive/STATUS.md`)
 
 | metric | legacy | Phase 1+2 (matvec+lru NEON) | **Phase 3 (fused layers)** | total vs legacy |
 |---|---:|---:|---:|---:|
@@ -220,18 +237,18 @@ requires GPU-side work (e.g. BATCH 8→4 → 2 blocks/SM).
 
 ## 8. Design principles
 
-- **Measure first, then optimize.** §3 in STATUS.md projected 50–100×
+- **Measure first, then optimize.** §3 in `docs/archive/STATUS.md` projected 50–100×
   speedup for a "warp-per-event" rewrite; the prototype's actual gain
   was 2–3×, and only after switching to the cell-owner partition design
   did we realize the projected gains (4–9×). Don't trust projections
   — run the bench.
 - **No unrequested features.** No extra error handling, fallback paths,
   comments, or design improvements beyond the task.
-- **Keep STATUS.md authoritative for measurements.** New measurement
+- **Keep `docs/PROFILE.md` authoritative for current measurements.** New measurement
   data lands in a new §-section (currently §7 is latest). Don't edit
   historical sections.
 - **Public README stays terse.** Headline numbers + quickstart only.
-  Detailed measurement logs live in `orin/STATUS.md`.
+  Detailed measurement logs live in `docs/archive/STATUS.md`.
 
 ## 9. Common pitfalls
 
