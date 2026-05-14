@@ -25,6 +25,18 @@ Reference platform: **NVIDIA Jetson Orin NX**.
   libraries built by default (`libstage0_capi.so`, `libstage01_capi.so`,
   `libstage01_to_gpu.so`) + the Python runtime under `orin/`.
 
+## 0.2 Development guide (READ THIS FIRST when porting / optimizing)
+
+**[`docs/DEV_GUIDE.md`](docs/DEV_GUIDE.md)** — comprehensive playbook
+distilled from real optimization work. Covers methodology, architecture
+invariants, what works, what doesn't (with measured negative results),
+profiling protocols, camera tuning, hardware adaptation checklists,
+SSLA-variant adaptation, common pitfalls, optimization decision tree.
+
+Read this **before** proposing or implementing any kernel/topology
+change. Failure modes are extensively documented to prevent re-running
+known dead ends.
+
 ## 1. Repo layout
 
 ```

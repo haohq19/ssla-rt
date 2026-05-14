@@ -229,6 +229,15 @@ ssla-rt/
 
 ---
 
+## Development guide
+
+Before modifying anything, read **[`docs/DEV_GUIDE.md`](docs/DEV_GUIDE.md)** —
+it captures the methodology, architecture invariants, working
+optimizations, dead-end experiments, hardware/camera/variant
+adaptation checklists, common pitfalls, and a decision tree for new
+optimizations. Read this **first** when porting to new hardware /
+camera / SSLA variant.
+
 ## What's been tried and the bottom line
 
 See [`docs/PIPELINE_DESIGN.md`](docs/PIPELINE_DESIGN.md) §§ 9–10 for
