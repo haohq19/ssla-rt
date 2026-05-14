@@ -325,6 +325,68 @@ def probe_thresholds(cam, dwell_s=1.5):
     print("Done. Useful max ≈ value where rate hits your noise floor.")
 
 
+def motion_probe(cam, thresholds, dwell_s):
+    """Sweep contrast thresholds while the user keeps producing a consistent
+    motion in front of the camera. Same motion → comparable rates across
+    thresholds. Each threshold held for `dwell_s` seconds.
+
+    Why: when you wave by hand, the motion pattern differs between trials,
+    so eyeballing rate change across threshold settings in the GUI is noisy.
+    This routine cycles thresholds automatically so you only have to keep
+    moving — the script handles the rest.
+    """
+    print(f"\n=== motion probe ===")
+    print(f"Wave / move in front of camera CONTINUOUSLY.")
+    print(f"Will cycle through {len(thresholds)} thresholds, "
+          f"{dwell_s}s each.")
+    print(f"Total time: ~{len(thresholds) * (dwell_s + 0.5):.0f}s.")
+    print(f"Starting in 3s — get ready...")
+    for i in range(3, 0, -1):
+        print(f"  {i}..."); time.sleep(1.0)
+    print(f"GO. Keep moving.\n")
+    print(f"{'threshold':>10} | {'rate kev/s':>12} | {'n_events':>10} | bar")
+    print("-" * 70)
+    results = []
+    max_rate = 0
+    for v in thresholds:
+        try:
+            cam.setContrastThresholdOn(v)
+            cam.setContrastThresholdOff(v)
+        except Exception as e:
+            print(f"{v:10d} | rejected: {e}")
+            continue
+        # 0.3s warmup: drain stale batches, let chip settle to new threshold.
+        t_warm = time.monotonic() + 0.3
+        while time.monotonic() < t_warm:
+            cam.getNextEventBatch()
+        t0 = time.monotonic()
+        n = 0
+        while time.monotonic() - t0 < dwell_s:
+            b = cam.getNextEventBatch()
+            if b is not None:
+                n += b.size()
+        rate_kev = n / dwell_s / 1e3
+        max_rate = max(max_rate, rate_kev)
+        results.append((v, rate_kev, n))
+        bar_len = int(40 * rate_kev / max(max_rate, 1.0))
+        bar = "█" * bar_len
+        print(f"{v:10d} | {rate_kev:12.1f} | {n:10d} | {bar}", flush=True)
+    print()
+    print("Done. Stop moving.")
+    print()
+    if len(results) >= 2:
+        rates = [r for _, r, _ in results]
+        if max(rates) > 1.5 * min(rates):
+            print(f"✓ Threshold IS having an effect "
+                  f"(min={min(rates):.0f} max={max(rates):.0f} kev/s).")
+            print(f"  Pick the threshold giving you the event rate you want.")
+        else:
+            print(f"⚠  Rates barely change ({min(rates):.0f}–{max(rates):.0f}"
+                  f" kev/s) — either chip floor dominates or motion was too "
+                  f"intermittent. Try more vigorous / consistent motion, or "
+                  f"narrow the threshold range to where you expect transitions.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--window-ms", type=int, default=33)
@@ -341,6 +403,15 @@ def main() -> int:
     ap.add_argument("--cam-interval-us", type=int, default=2000,
                     help="DVXplorer setTimeInterval / setMIPITimeoutValue [us]")
     ap.add_argument("--probe-thresholds", action="store_true")
+    ap.add_argument("--motion-probe", action="store_true",
+                    help="Cycle through thresholds while you keep moving in "
+                         "front of the camera. Compares rates under one "
+                         "consistent motion. Pairs with --motion-probe-* below.")
+    ap.add_argument("--motion-probe-thresholds", type=str,
+                    default="5,8,10,12,15,20,30,50",
+                    help="Comma-separated list (default: 5,8,10,12,15,20,30,50)")
+    ap.add_argument("--motion-probe-dwell-s", type=float, default=3.0,
+                    help="Seconds to hold each threshold (default: 3.0)")
     ap.add_argument("--list-methods", action="store_true")
     args = ap.parse_args()
 
@@ -367,6 +438,16 @@ def main() -> int:
 
     if args.probe_thresholds:
         probe_thresholds(cam)
+        return 0
+
+    if args.motion_probe:
+        try:
+            thr_list = [int(x) for x in args.motion_probe_thresholds.split(",")
+                        if x.strip()]
+        except ValueError as e:
+            print(f"Bad --motion-probe-thresholds: {e}")
+            return 1
+        motion_probe(cam, thr_list, args.motion_probe_dwell_s)
         return 0
 
     _safe(cam.setContrastThresholdOn,  args.contrast_on,  "ContrastThresholdOn")
