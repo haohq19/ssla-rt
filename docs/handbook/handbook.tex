@@ -1,0 +1,1105 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!60!black,
+  citecolor=black,
+  pdftitle={SSLA-RT Engineering Handbook},
+  pdfauthor={ssla-rt},
+}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{codecomment}{rgb}{0.4,0.4,0.4}
+\definecolor{codekw}{rgb}{0.1,0.3,0.7}
+\definecolor{codestr}{rgb}{0.6,0.3,0.1}
+
+\lstdefinestyle{code}{
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{codecomment}\itshape,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  basicstyle=\ttfamily\footnotesize,
+  breakatwhitespace=false,
+  breaklines=true,
+  captionpos=b,
+  keepspaces=true,
+  showspaces=false,
+  showstringspaces=false,
+  showtabs=false,
+  tabsize=2,
+  frame=single,
+  framerule=0pt,
+  framexleftmargin=4pt,
+  framexrightmargin=4pt,
+  framextopmargin=4pt,
+  framexbottommargin=4pt,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+}
+\lstset{style=code}
+\lstdefinelanguage{CUDA}{
+  morekeywords={__global__,__device__,__shared__,__syncthreads,__syncwarp,
+    __launch_bounds__,extern,const,float,int,unsigned,long,bool,void,
+    constexpr,if,else,for,while,return,struct,template,class,inline,
+    static,volatile,nullptr,true,false,sizeof},
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]"
+}
+\lstdefinelanguage{Bash}{
+  morekeywords={cmake,make,python3,python,cd,mkdir,sudo,apt,bash,echo,export,for,do,done,if,then,fi,git},
+  morecomment=[l]{\#},
+  morestring=[b]"
+}
+
+\titleformat{\section}{\normalfont\Large\bfseries\color{blue!40!black}}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries\color{blue!50!black}}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalfont\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{0pt}
+
+% ----------------------------------------------------------------------
+\begin{document}
+
+\begin{titlepage}
+\vspace*{4cm}
+\begin{center}
+\Huge\bfseries SSLA-RT Engineering Handbook
+\par\vspace{1.5cm}
+\Large
+Real-Time Event-Camera Inference\\on Jetson Orin NX
+\par\vspace{2.5cm}
+\large
+A consolidated technical record of the design decisions, optimizations,\\
+failed experiments, and integration work performed during the\\
+porting and tuning of SSLA-S to the Orin NX + DVXplorer Micro target.
+\par\vspace{4cm}
+\normalsize
+2026-05-14\\[0.4cm]
+\texttt{ssla-rt} repository --- \texttt{docs/handbook/}
+\end{center}
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+% ====================================================================
+\section{Scope and Purpose}
+
+This handbook is a single-document reference covering the engineering work
+that took the SSLA-S event-camera detector from a research codebase to a
+real-time inference runtime on the NVIDIA Jetson Orin NX edge platform.
+It is intended to be readable cold by an engineer who must:
+
+\begin{itemize}[itemsep=0pt]
+  \item resume the optimization work after a break,
+  \item port the runtime to a different Jetson SKU or future GPU,
+  \item swap in a different event camera,
+  \item adapt the design to a different SSLA backbone variant.
+\end{itemize}
+
+It complements three companion documents that already live in the
+repository:
+
+\begin{itemize}[itemsep=0pt]
+  \item \texttt{docs/PIPELINE\_DESIGN.md} --- the canonical pipeline diagram
+        and constraint set.
+  \item \texttt{docs/PROFILE.md} --- the authoritative latency and
+        throughput numbers (refreshed measurement-by-measurement).
+  \item \texttt{docs/DEV\_GUIDE.md} --- the methodological playbook,
+        hardware-adaptation checklists, and the running record of
+        dead-end optimization attempts.
+\end{itemize}
+
+The handbook does not duplicate those files. Where they go into
+file-and-line detail, this document presents the consolidated
+\emph{narrative} of how the system was built and why it looks the way it
+does, so that future readers can recover not only the answer but also
+the chain of reasoning that produced it.
+
+% ====================================================================
+\section{System at a Glance}
+
+\subsection{Reference platform}
+
+\begin{tabularx}{\linewidth}{lX}
+\toprule
+Compute & NVIDIA Jetson Orin NX (8\,SMs, sm\_87, SM clock pinned at
+          918\,MHz in MAXN). \\
+Sensor  & iniVation DVXplorer Micro, 640$\times$480 sensor, USB\,2.0,
+          accessed via \texttt{dv-processing} 2.0.3+. \\
+Network & SSLA-S: 4-stage recurrent event backbone with a YOLOX-style
+          detection head. 0.5\,M parameters, $\sim$ 96 hidden channels
+          at the final stage. \\
+Throughput target & 1\,Mev/s (events per second), end-to-end. \\
+Latency target    & sub-millisecond emit-to-prediction for output-producing
+                    events. \\
+\bottomrule
+\end{tabularx}
+
+\subsection{Pipeline shape}
+
+The deployment splits SSLA-S across CPU and GPU. The CPU handles the
+first two backbone stages (layers \texttt{L0}--\texttt{L3}) and the
+intermediate spatial downsamples and temporal dropouts. Events are then
+pushed to a per-block pinned-host ring; a persistent GPU kernel
+consumes that ring, runs stages~3 and~4 (layers \texttt{L4}--\texttt{L7}),
+and writes per-cell predictions to a second pinned-host buffer.
+
+\begin{center}
+\small
+\begin{tabular}{l}
+\toprule
+\textbf{End-to-end flow} \\
+\midrule
+\texttt{emit (camera/synth)} \\
+\;\;\;\(\downarrow\) \\
+\texttt{CPU shard:\;L0\(\to\)L1\(\to\)pool\(\to\)tdrop\(_{s2}\)\(\to\)L2\(\to\)L3\(\to\)pool\(\to\)tdrop\(_{s3}\)} \\
+\;\;\;\(\downarrow\)\;\; \emph{push} \\
+\texttt{Pinned ring (per-block SPSC, 64 KiB records)} \\
+\;\;\;\(\downarrow\)\;\; \emph{pop} \\
+\texttt{GPU persistent kernel:\;tdrop\(_{s2}\)\(\to\)L4\(\to\)L5\(\to\)pool\(\to\)tdrop\(_{s3}\)\(\to\)L6\(\to\)L7\(\to\)head} \\
+\;\;\;\(\downarrow\) \\
+\texttt{Pinned predictions buffer (per-cell, version-tagged)} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Production performance ceiling}
+
+\begin{tabularx}{\linewidth}{lXr}
+\toprule
+\textbf{Metric} & \textbf{Setting} & \textbf{Value} \\
+\midrule
+CPU admit ceiling (stable)   & 8 shards (n=6 sustainable), halo=2, fused NEON layer & 1.85--2.0 Mev/s \\
+GPU drain ceiling            & 8 blocks, persistent kernel, balanced 2W$\times$4H topology & 227--230 kev/s \\
+Per-event GPU kernel p50     & at saturation                                              & $\sim$310 \(\mu\)s \\
+End-to-end emit\(\to\)done p50 & at saturation (output-producing events only)             & $\sim$330 \(\mu\)s \\
+\bottomrule
+\end{tabularx}
+
+Numbers are the current values at the end of the May 2026 optimization
+campaign, with stub weights. They are reproduced from
+\texttt{docs/PROFILE.md}\,\S\S 1--2; see there for sweeps, percentiles,
+and historical comparison.
+
+% ====================================================================
+\section{Hardware-Imposed Invariants}
+
+These constraints are not negotiable design choices: they come from
+the physical characteristics of the Orin NX and the SSLA-S architecture.
+Violating any of them silently breaks correctness or causes deadlocks.
+
+\subsection{Tegra coherence: pinned memory for cross-CPU/GPU traffic}
+
+Orin NX reports \texttt{CONCURRENT\_MANAGED\_ACCESS = 0}. Practical
+consequence: CUDA managed memory is \emph{not safe} to use for data that
+the CPU writes while the GPU is concurrently reading. The driver runs
+in the legacy migrate-on-launch mode, in which a managed page must be
+fully owned by one side at a time.
+
+Every cross-domain buffer therefore lives in \textbf{pinned host memory},
+allocated via \texttt{cuMemHostAlloc}:
+
+\begin{itemize}[itemsep=0pt]
+  \item per-block ring buffers (CPU writes, GPU polls),
+  \item ring head and tail atomics,
+  \item the stop flag,
+  \item the per-cell predictions buffer.
+\end{itemize}
+
+Managed memory (\texttt{cuMemAllocManaged}) is reserved for GPU-only state:
+
+\begin{itemize}[itemsep=0pt]
+  \item hidden state (read and written by GPU only),
+  \item layer and head weights (CPU writes once at init, GPU reads forever),
+  \item tdrop counters (GPU only after init zero),
+  \item GPU timing slots.
+\end{itemize}
+
+The helpers \texttt{cuda\_util.alloc\_pinned} and
+\texttt{cuda\_util.alloc\_managed} (Python) document which class each
+buffer should be in. Using the wrong class produces stale reads that
+look like correctness bugs.
+
+\subsection{Halo $=2$ at every CPU sharding boundary --- LOCKED}
+
+The CPU pipeline shards in the spatial domain. Two adjacent shards must
+overlap by a halo of at least 2 cells at the resolution of the
+\emph{coarser} of the two pooling steps that bracket the layer in
+question. For SSLA-S, this works out to \textbf{halo = 2 at the s2
+grid}, which after the next s1\(\to\)s2 pool still gives the needed
+$\pm 1$ at s3 for the 3$\times$3 patch.
+
+Halo = 1 is \emph{not} sufficient because:
+
+\begin{itemize}[itemsep=0pt]
+  \item the 3$\times$3 spatial convolution at the current resolution
+        needs $\pm 1$ cell of halo at that resolution, but
+  \item after the next pool, the same convolution at the next
+        resolution needs $\pm 1$ at that resolution, which is $\pm 2$
+        cells at the current resolution.
+\end{itemize}
+
+This rule is enforced in \texttt{lib\_stage01\_to\_gpu.cpp} and must be
+preserved by every future sharding scheme. It is one of the few
+explicit \emph{locked} constraints of the design --- the project's
+durable rule.
+
+\subsection{Cell-owner warp partition: race-free without GPU atomics}
+
+The production GPU kernel uses 9 warps per CUDA block, indexed
+\texttt{warp\_id $\in [0,9)$}. Each warp owns the hidden-state cells
+whose 2-D index satisfies
+\[
+  (\mathrm{cy} \bmod 3,\;\mathrm{cx} \bmod 3) = (\lfloor \mathrm{warp\_id}/3 \rfloor,\;\mathrm{warp\_id} \bmod 3).
+\]
+For any event whose 3$\times$3 patch needs to update 9 hidden cells,
+the 9 cells map to 9 distinct \texttt{(cy\,\%\,3, cx\,\%\,3)} pairs,
+hence to 9 distinct owning warps. Therefore \textbf{any given hidden
+cell is written by exactly one warp ever}, eliminating the need for
+\texttt{atomicAdd} or any cross-warp synchronization on hidden state.
+
+The kernel uses \texttt{\_\_syncthreads()} only between coarse-grained
+phases (\textsc{DISPATCH}, \textsc{COMPUTE}, \textsc{GATHER},
+\textsc{TDROP}), not inside the per-event step. Within a warp's queue
+of (event, delta) tasks, the sequential processing uses only
+\texttt{\_\_syncwarp()} and warp shuffles.
+
+If a future kernel restructuring reduces the warp count or changes the
+ownership function, the race-free property must be re-proven from
+scratch, and the P1 oracle drift gate
+(\texttt{bench\_s2\_s3\_head\_celled.py}) will catch any violation
+within a few hundred events.
+
+% ====================================================================
+\section{CPU Pipeline}
+
+\subsection{Topology}
+
+The CPU side consists of $N$ shard threads (currently $N=6$ on cores
+1--6) each handling a contiguous Y-band of the input grid with a 2-cell
+overlap to the next shard. Events whose $y$ coordinate falls inside the
+band are processed; events on the overlap are processed by both
+neighbours and reconciled at the GPU side via ownership (each event
+ends up routed to exactly one GPU block by the same cell-owner
+function).
+
+Per-shard work for one event:
+
+\[
+  \texttt{stage\_0}\;(L_0 + L_1) \;\to\; \texttt{pool\,/2} \;\to\; \texttt{tdrop}_{s2}
+  \;\to\; \texttt{stage\_1}\;(L_2 + L_3) \;\to\; \texttt{pool\,/2} \;\to\; \texttt{tdrop}_{s3}
+\]
+
+Each stage applies a \emph{layer\_pair}: \texttt{matvec\(\to\)LRU
+step\(\to\)matvec\_accum\(\to\)gather\(\to\)LayerNorm}. With halo,
+each shard touches roughly $1/N + 2\Delta$ of the grid where $\Delta$
+is the halo width in cells.
+
+\subsection{NEON optimization rounds}
+
+The CPU per-event budget went through three optimization rounds, each
+documented in \texttt{docs/PROFILE.md} and \texttt{docs/DEV\_LOG.md}.
+
+\subsubsection*{Round 1 (baseline)}
+
+GCC autovectorization on the matvec and LRU loops. Per-shard rate
+$\sim$135 kev/s; system ceiling $\sim$0.82 Mev/s at $n=8$ shards.
+
+\subsubsection*{Round 2 (matvec + LRU NEON)}
+
+Hand-written NEON specializations of \texttt{matvec\_ct<12,36>} and
+\texttt{matvec\_ct<24,72>} (the IN=12 and IN=24 layers) using 4-output
+ILP, plus a NEON sigmoid approximation for the LRU gate. Per-shard rate
+rose to 216 kev/s; system ceiling 1.30 Mev/s at $n=7$.
+
+\subsubsection*{Round 3 (fused interior layer kernel)}
+
+A hand-fused inner kernel that holds \texttt{qvg} and \texttt{qh} in
+named NEON registers (\texttt{float32x4\_t} variables) across the
+matvec\,\(\to\)\,LRU\,\(\to\)\,matvec\_accum sequence, instead of
+spilling them to a \texttt{qvg[18]} array between primitives. Drops the
+spill cost and lets the compiler keep them register-resident across
+the LRU step. Per-shard rate 327 kev/s at $n=4$; system ceiling
+\textbf{1.85 Mev/s stable at $n=6$}, with burst $\sim$2.0 Mev/s at
+$n=8$.
+
+\subsubsection*{Pitfall worth remembering}
+
+The fused kernel only realized its gain when written with \emph{named}
+\texttt{float32x4\_t} variables. A version using
+\texttt{float32x4\_t qvg[18]} (array of 18 NEON registers) compiles
+correctly but does not deliver the speedup --- the array form pessimizes
+the register allocator into spilling. The named-variable form is the
+canonical recipe, recorded in \texttt{ssla\_kernels.cpp}.
+
+\subsection{Per-event stage breakdown}
+
+\begin{tabularx}{\linewidth}{lXrrr}
+\toprule
+& & Round\,1 & Round\,2 & Round\,3 \\
+\midrule
+\(L_0+L_1\) (\texttt{stage\_forward(0)}) & per event & 3.94 \(\mu\)s & 1.83 \(\mu\)s & \textbf{1.05 \(\mu\)s} \\
+\(L_2+L_3\) (\texttt{stage\_forward(1)}) & per event & 12.88 \(\mu\)s & 9.50 \(\mu\)s & \textbf{5.34 \(\mu\)s} \\
+Per-shard rate                          & sustained  & 135 kev/s   & 216 kev/s  & \textbf{327 kev/s} \\
+System ceiling (stable)                  & best $n$  & 0.82 Mev/s ($n=8$) & 1.30 Mev/s ($n=7$) & \textbf{1.85 Mev/s ($n=6$)} \\
+\bottomrule
+\end{tabularx}
+
+% ====================================================================
+\section{GPU Kernel: \texttt{ssla\_s2\_s3\_head\_celled.cuh}}
+
+This is the production GPU kernel. It is launched once at startup as a
+\emph{persistent} kernel and runs until the host sets a stop flag.
+There is one CUDA block per GPU block in the topology (currently 8),
+each pinned to one SM by virtue of the grid dimension equaling the SM
+count.
+
+\subsection{Per-block run loop}
+
+\begin{enumerate}[itemsep=0pt]
+  \item Sleep-poll the ring tail until at least one event is published.
+  \item Take the next contiguous run of up to \texttt{BATCH = 8} events
+        (the batch never spans non-contiguous slots; consumed in order).
+  \item Snapshot the batch into shared memory (\texttt{event\_slots}).
+  \item Run \texttt{tdrop\(_{s2}\)} for the batch, writing per-event
+        \texttt{pass2} flags.
+  \item Run \(L_4\) (\texttt{run\_layer\_celled\_implicit}) and \(L_5\)
+        (\texttt{run\_layer\_celled\_implicit\_split} with the
+        \texttt{pass2} output mask).
+  \item Pool s2 coordinates to s3 (right shift by 1).
+  \item Run \texttt{tdrop\(_{s3}\)} with the \texttt{pass2} mask,
+        writing \texttt{pass3} flags.
+  \item Run \(L_6\) and \(L_7\) (same pattern, with \texttt{pass2} as
+        enter-mask and \texttt{pass3} as output-mask).
+  \item Run the YOLOX head for events with
+        \texttt{is\_owner $\wedge$ pass2 $\wedge$ pass3}; write
+        per-cell predictions and increment the per-cell version
+        counter.
+  \item Record per-event timing in the timing-slot ring.
+  \item Advance ring tail; update \texttt{events\_done} counter.
+\end{enumerate}
+
+\subsection{Implicit-dispatch layer step}
+
+For each layer, the kernel computes, in lock-step across the 9 warps:
+
+\begin{enumerate}[itemsep=0pt]
+  \item \textbf{DISPATCH}: each warp scans the batch and finds events
+        whose 3$\times$3 patch covers a cell it owns. The corresponding
+        \texttt{(event, delta)} pairs go into a per-warp task queue.
+  \item \textbf{COMPUTE}: each warp processes its queued tasks
+        sequentially: \texttt{qvg matvec\(\to\)LRU step\(\to\)goW
+        matvec} into a per-event contribution slot. Hidden state
+        writes are exclusive to the owning warp.
+  \item \textbf{GATHER}: one warp per event sums the 9 warp
+        contributions plus the residual, applies LayerNorm, and writes
+        the result back into the event's broadcast slot for the next
+        layer.
+\end{enumerate}
+
+Cross-warp synchronization is one \texttt{\_\_syncthreads()} between
+the three phases. Inside a phase, only \texttt{\_\_syncwarp()} is
+needed.
+
+\subsection{Optimizations applied to the kernel}
+
+\subsubsection*{L4 \texttt{qvgIn} shared-memory cache (121 KB)}
+
+The \(L_4\) \texttt{qvgIn} tensor (9 patches $\times$ 3 projections $\times$
+$48 \times 24$) is exactly 121 KB. Loading it into shared memory once
+per block at kernel entry, and reading from smem rather than from
+global memory in the layer-step matvecs, eliminated the L2/DRAM
+re-fetch on every batch and removed a measurable L2 thrash signature in
+\texttt{nvprof}. Required \texttt{\_\_launch\_bounds\_\_(288, 1)} and
+\texttt{cuFuncSetAttribute(MAX\_DYNAMIC\_SHARED\_SIZE\_BYTES)} since
+Orin NX sm\_87 supports up to $\sim$167 KB dynamic smem per block.
+
+Realized gain: \(+\) 4\% throughput. (Initial projection was 20--30\% ---
+see \S \ref{sec:methodology} for the cost of trusting projections.)
+
+\subsubsection*{L7 \texttt{qvgIn} L2-persistence window (perf bench only)}
+
+\(L_7\)'s \texttt{qvgIn} (972 KB) is too large for smem but fits the L2
+working set if pinned via
+\texttt{CU\_STREAM\_ATTRIBUTE\_ACCESS\_POLICY\_WINDOW}. This gives
+$+1.7$\% offline and approximately $0$\% live. Currently enabled only
+in the offline perf bench --- not worth a kernel-level dependency.
+
+\subsubsection*{Balanced 2W $\times$ 4H topology (corner blocks taller)}
+
+The 8-block topology splits the s2 grid into 2 columns and 4 rows. The
+default equal-rows split leaves the middle blocks bottlenecked because
+mid-image typically contains the most motion. Balancing the Y splits to
+5/3/3/5 cells brought middle blocks down to the same rate as corner
+blocks ($\sim$28 kev/s each), realizing $+$ 4\% over the equal split.
+
+\subsubsection*{State-only (VG-only) path for tdrop-dropped events at L5/L7}
+
+Events that fail \texttt{tdrop\(_{s2}\)} or \texttt{tdrop\(_{s3}\)}
+still need their hidden state to advance (the LRU recurrence is
+unconditional), but their final output (Q matrix and post-LN
+projection) is unused. The VG-only branch in
+\texttt{process\_patch\_cell\_state\_only} skips the Q matvec and the
+post-LRU \texttt{qh} compute. Realized gain: $+$ 3\% throughput.
+
+\subsubsection*{A1 optimization: skip head for dropped events}
+
+Events that fail \texttt{tdrop\(_{s3}\)} have their predictions
+discarded anyway. The head section skips them entirely (no head
+matvec, no preds write, no version bump). Trivial save but
+non-negligible at saturation.
+
+\subsection{Smem budget at the production layout}
+
+\begin{tabularx}{\linewidth}{lr}
+\toprule
+\textbf{Buffer} & \textbf{Bytes} \\
+\midrule
+event\_slots[BATCH=8] $\times$ (in\_feat + meta)             & $\sim$5\,400 \\
+contrib[BATCH][9 warps][OUT\_MAX=96]                          & 27\,648 \\
+per\_warp\_in\_feat\_sm[9][96]                                & 3\,456 \\
+per\_warp\_qh\_sm[9][96] \emph{(reused for head)}             & 3\,456 \\
+task\_event / task\_delta / task\_count / pass2 / pass3      & $\sim$700 \\
+L4 qvgIn cache (9 $\times$ 3 $\times$ 48 $\times$ 24)         & 124\,416 \\
+\midrule
+Total                                                         & $\sim$166\,128 (rounded to 16 B) \\
+\bottomrule
+\end{tabularx}
+
+% ====================================================================
+\section{Real-Time Demo Pipeline}
+
+The live runner (\texttt{orin/hybrid\_runner\_multi.py}) wraps the
+production kernel with a DVXplorer camera reader thread, a display
+thread (cv2 window), and a stats loop. This section describes the
+demo's structure and the pitfalls encountered building it.
+
+\subsection{Camera reader thread}
+
+\begin{lstlisting}[language=Python,caption={Camera reader, simplified.}]
+class CameraReader(threading.Thread):
+    SS_LADDER = {"EVERY_PIXEL": 1, "EVERY_SECOND": 2,
+                 "EVERY_FOURTH": 4, "EVERY_EIGHTH": 8}
+
+    def run(self):
+        import dv_processing as dv
+        cam = dv.io.camera.open()
+        cam.setSubSampleHorizontal(SS_VAL); cam.setSubSampleVertical(SS_VAL)
+        cam.setContrastThresholdOn(contrast)
+        cam.setContrastThresholdOff(contrast)
+        cam.setCropArea((roi_x, roi_y, roi_w, roi_h))
+
+        while not self.stop_event.is_set():
+            batch = cam.getNextEventBatch()
+            ev = batch.numpy()
+            packed = np.empty((ev.size, 4), dtype=np.float32)
+            packed[:, 0] = (ev["timestamp"] - t0).astype(np.float32)
+            # Translate to ROI origin then subsample.
+            packed[:, 1] = ((ev["x"] - roi_x) // ds).astype(np.float32)
+            packed[:, 2] = ((ev["y"] - roi_y) // ds).astype(np.float32)
+            packed[:, 3] = ev["polarity"].astype(np.float32)
+            self.api.submit(packed[valid])
+\end{lstlisting}
+
+Three subtle details:
+
+\begin{description}[itemsep=0pt,leftmargin=*]
+  \item[Library choice.] iniVation's older C library
+        \texttt{libcaer} (3.3.17) cannot open the DVXplorer
+        \emph{Micro} variant; only the C++ \texttt{dv-processing}
+        library $\geq$ 2.0.3 does. The Python bindings of
+        \texttt{dv-processing} are the easiest path on Orin.
+  \item[Contrast threshold range.] The DVXplorer Micro chip silently
+        clamps the contrast threshold at 17. The
+        \texttt{getContrastThreshold()} getter returns whatever value
+        was set, regardless of the clamp, so readback does \emph{not}
+        reveal that values above 17 are ineffective. The full valid
+        range is therefore 0--17, not 0--255 as the API docs suggest.
+        Use 6--10 for balanced sensitivity, 2--4 for high sensitivity,
+        12--17 for low.
+  \item[ROI translation.] \texttt{setCropArea} crops the sensor
+        in-hardware, but the event coordinates still arrive in
+        sensor-space. Subtract the crop origin before feeding to the
+        SSLA grid, otherwise events miss the grid.
+\end{description}
+
+\subsection{Display thread}
+
+\subsubsection*{Render at native resolution, scale once}
+
+Naively rendering events at the upscaled display resolution and
+splatting scale$\times$scale squares per event costs $O(scale^2)$ per
+event and dominates frame time at 30\,fps. The correct pattern is:
+
+\begin{enumerate}[itemsep=0pt]
+  \item Build a small canvas of size $H\times W$ (native event resolution).
+  \item Splat events at native resolution (one pixel per event).
+  \item \texttt{cv2.resize(small, (W$\times$s, H$\times$s),
+        INTER\_NEAREST)} for the upscale.
+\end{enumerate}
+
+\texttt{cv2.resize} is heavily optimized C, while a Python-level splat
+loop pays the GIL repeatedly. Measured difference: from "feels laggy"
+to smooth 30\,fps.
+
+\subsubsection*{Frame pacing via \texttt{cv2.waitKey}}
+
+Use \texttt{cv2.waitKey(wait\_ms)} for both the GUI event pump and
+frame pacing, not a Python \texttt{time.sleep} loop. The \texttt{waitKey}
+call pumps the X11/Wayland event loop, which a sleep does not, and is
+also the only portable way to detect the ESC key. Compute the wait
+budget as $\max(1, \text{period}_{\text{ms}} - \text{elapsed}_{\text{ms}})$.
+
+\subsubsection*{Non-maximum suppression with \texttt{cv2.dnn.NMSBoxes}}
+
+The per-cell head produces one bounding box per s3 cell. To collapse
+duplicates we run NMS across all blocks' candidates:
+
+\begin{lstlisting}[language=Python]
+keep_idx = cv2.dnn.NMSBoxes(boxes_xywh, scores,
+                            score_threshold=obj_thresh,
+                            nms_threshold=nms_iou)
+\end{lstlisting}
+
+\textbf{Footgun:} \texttt{cv2.dnn.NMSBoxes} asserts
+\texttt{score\_threshold} $\geq$ 0. If the threshold is computed
+dynamically (e.g.\ to accommodate a top-K fallback path that includes
+sub-threshold candidates), clamp it to zero:
+\texttt{eff\_conf = max(0.0, $\dots$)}.
+
+% ====================================================================
+\section{Trained-Checkpoint Loading}
+
+The May 2026 work added the ability to run the deploy pipeline with a
+real DSEC-trained SSLA-S checkpoint, not just random/stub weights.
+This required both Python-side wiring and one structural change to the
+GPU kernel (a real 2-layer YOLOX head). The section is detailed
+because the integration touched several seemingly unrelated parts of
+the code at once.
+
+\subsection{Checkpoint inspection}
+
+The upstream checkpoint is a PyTorch Lightning \texttt{.ckpt} produced
+by the openeva research repository. The relevant parts:
+
+\begin{lstlisting}[language=Python,caption={Inspecting the checkpoint.}]
+ck = torch.load("best_epoch=41-step=52500.ckpt", map_location="cpu")
+sd  = ck["state_dict"]           # live optimizer state
+ema = ck["ema_state_dict"]       # EMA-of-weights (decay 0.9999), eval-preferred
+hp  = ck["hyper_parameters"]     # dataset (DSEC), height/width, stages, ...
+\end{lstlisting}
+
+\textbf{Use the EMA state dict at inference}; the live optimizer state
+is generally slightly worse-generalizing. Both have identical
+structure for this model.
+
+The state dict contains 96 tensors in two groups: backbone layers (the
+8 SSLA-S layers) and a YOLOX-style detection head.
+
+\subsection{Layer index remapping}
+
+The upstream model uses non-contiguous layer indices because the
+\texttt{spatial\_downsample} and \texttt{temporal\_dropout} operators
+also take index slots in its \texttt{nn.Sequential}-like layout. The
+deploy uses consecutive indices 0--7. The conversion table is:
+
+\begin{tabularx}{\linewidth}{lXl}
+\toprule
+\textbf{Upstream index} & \textbf{Description}                       & \textbf{Deploy index} \\
+\midrule
+0  & stage 0, layer 0 (K=1, 2 $\to$ 12)                              & 0 \\
+1  & stage 0, layer 1 (K=3, 12 $\to$ 12)                              & 1 \\
+4  & stage 1, layer 0 (K=3, 12 $\to$ 24)                              & 2 \\
+5  & stage 1, layer 1 (K=3, 24 $\to$ 24)                              & 3 \\
+8  & stage 2, layer 0 (K=3, 24 $\to$ 48)                              & 4 \\
+9  & stage 2, layer 1 (K=3, 48 $\to$ 48)                              & 5 \\
+12 & stage 3, layer 0 (K=3, 48 $\to$ 96)                              & 6 \\
+13 & stage 3, layer 1 (K=3, 96 $\to$ 96)                              & 7 \\
+\bottomrule
+\end{tabularx}
+
+Indices 2,3,6,7,10,11 are stateless ops (pool, tdrop) with no
+parameters and so are not exported.
+
+The conversion script \texttt{tools/convert\_dsec\_ckpt.py} performs
+this remap, drops unused buffers
+(\texttt{pixel2patch\_lut}, \texttt{num\_batches\_tracked}), and writes
+the standard \texttt{weights.npz + meta.json} pair that
+\texttt{libstage01\_to\_gpu} expects.
+
+\subsection{2-layer YOLOX head structure}
+
+The trained head is markedly more complex than the random
+single-linear head used during early stub-only testing:
+
+\begin{tabularx}{\linewidth}{lXl}
+\toprule
+\textbf{Tensor} & \textbf{Shape} & \textbf{Role} \\
+\midrule
+\texttt{head/cls\_convs/0/0/weight} & (96, 96, 1, 1)             & 1$\times$1 conv, classification branch \\
+\texttt{head/cls\_convs/0/0/bias}   & (96,)                       & conv bias (absent in stub schema) \\
+\texttt{head/cls\_convs/0/1/*}      & (96,)$\times$4              & BatchNorm (\(\gamma, \beta, \mu, \sigma^2\)) \\
+\texttt{head/cls\_preds/0/weight}   & (2, 96, 1, 1)              & 2 class logits per cell \\
+\texttt{head/cls\_preds/0/bias}     & (2,)                       & \\
+\texttt{head/reg\_convs/0/*}        & (96, 96, ...)              & 1$\times$1 conv, regression/obj branch \\
+\texttt{head/reg\_preds/0/weight}   & (4, 96, 1, 1)              & 4 bbox parameters (tx, ty, log\_w, log\_h) \\
+\texttt{head/reg\_preds/0/bias}     & (4,)                       & \\
+\texttt{head/obj\_preds/0/weight}   & (1, 96, 1, 1)              & objectness logit \\
+\texttt{head/obj\_preds/0/bias}     & (1,)                       & \\
+\bottomrule
+\end{tabularx}
+
+Per-cell forward pass:
+
+\begin{align*}
+y_{\text{cls}} &= \mathrm{SiLU}(W_{\text{cls\_conv}} \cdot x + b_{\text{cls\_conv}}) \\
+\text{cls\_logits} &= W_{\text{cls\_pred}} \cdot y_{\text{cls}} + b_{\text{cls\_pred}} \\[0.3em]
+y_{\text{reg}} &= \mathrm{SiLU}(W_{\text{reg\_conv}} \cdot x + b_{\text{reg\_conv}}) \\
+\text{reg\_out} &= W_{\text{reg\_pred}} \cdot y_{\text{reg}} + b_{\text{reg\_pred}} \\
+\text{obj\_logit} &= W_{\text{obj\_pred}} \cdot y_{\text{reg}} + b_{\text{obj\_pred}}
+\end{align*}
+
+The two branches share the input $x$ (the L7 output, $C_3 = 96$
+channels) but have \emph{separate} 96$\to$96 conv layers. The
+non-linearity SiLU prevents fusing into a single matrix.
+
+\subsection{Folding BatchNorm into the conv weights}
+
+BatchNorm at eval mode is a per-channel affine transform:
+\[
+y_{\text{bn}}[c] = \gamma[c] \cdot \frac{y[c] - \mu[c]}{\sqrt{\sigma^2[c] + \epsilon}} + \beta[c]
+                  = \mathrm{scale}[c] \cdot y[c] + \mathrm{shift}[c]
+\]
+with $\mathrm{scale} = \gamma / \sqrt{\sigma^2 + \epsilon}$ and
+$\mathrm{shift} = \beta - \mathrm{scale} \cdot \mu$. Composing with the
+preceding 1$\times$1 conv:
+\[
+W^{\text{fused}}_{c_{\text{out}}, c_{\text{in}}} = \mathrm{scale}[c_{\text{out}}] \cdot W^{\text{conv}}_{c_{\text{out}}, c_{\text{in}}}, \qquad
+b^{\text{fused}}_{c_{\text{out}}} = \mathrm{scale}[c_{\text{out}}] \cdot b^{\text{conv}}_{c_{\text{out}}} + \mathrm{shift}[c_{\text{out}}].
+\]
+The folded conv reads identical numbers at inference but saves
+the explicit BN normalization at every event. Implemented in
+\texttt{hybrid\_common.py::\_fuse\_conv\_bn}.
+
+\subsection{GPU kernel changes for the 2-layer head}
+
+The original kernel had a single linear head:
+\texttt{preds = head\_W $\cdot$ L7\_out + head\_b} with
+\texttt{HEAD\_OUT = 7}. The trained head is structurally different,
+not a fusable approximation.
+
+Added to the kernel:
+
+\begin{enumerate}[itemsep=0pt]
+  \item Ten new pointer fields on \texttt{HybridS2S3Config}:
+        \texttt{head\_\{cls,reg\}\_conv\_\{W,b\}},
+        \texttt{head\_\{cls,reg,obj\}\_pred\_\{W,b\}}.
+  \item A \texttt{\_\_device\_\_} helper \texttt{do\_two\_layer\_head}
+        that runs the per-event 96$\to$96, SiLU, 96$\to$\{2,4,1\}
+        sequence using one warp per event. The 96-float intermediate
+        is stored in the existing per-warp \texttt{qh} smem slot,
+        which is unused after the layer pipeline finishes.
+  \item A dispatch in the kernel head section:
+        \texttt{cfg.head\_cls\_conv\_W != 0} selects the trained path;
+        otherwise the legacy single-linear path runs (used for stub
+        weights).
+\end{enumerate}
+
+The Python mirror of the config struct
+(\texttt{hybrid\_common.py::CHybridS2S3Config}) gained matching
+\texttt{c\_uint64} fields so that the \texttt{memmove(p\_cfg,
+addressof(cfg), sizeof(cfg))} call drops the right pointers into the
+right slots.
+
+\subsection{Bug: \texttt{replace\_all} and duplicated kernel sections}
+
+The kernel has \emph{two} structurally identical head sections, one in
+\texttt{k\_ssla\_s2s3\_celled\_persistent} (single-block legacy) and
+one in \texttt{k\_ssla\_s2s3\_celled\_persistent\_multi} (the
+production multi-block kernel that the live runner actually launches).
+The two sections differ slightly only in their leading comment line.
+
+When the head dispatch was originally added via a search-and-replace
+\texttt{replace\_all=true}, only the first occurrence was matched and
+updated. The second --- the production one --- continued to use the
+old single-linear path that triggers only on \texttt{cfg.head\_W != 0}.
+When the Python side wired up the trained head, it set
+\texttt{cfg.head\_W = 0} (legacy field unused) and
+\texttt{cfg.head\_cls\_conv\_W = <trained ptr>}. The kernel still ran
+the old branch, saw \texttt{head\_W == 0}, and skipped the head
+entirely. The pinned predictions buffer was therefore never written.
+On the host side, \texttt{sigmoid(0) = 0.5}, hence the symptom: every
+displayed object score was 0.5.
+
+The diagnosis used a kernel-side \texttt{printf} of all 10 head
+pointers, which confirmed that the pointers \emph{were} reaching the
+GPU correctly (struct offsets matched between Python ctypes and the
+CUDA struct). That left "code path not taken" as the only remaining
+hypothesis, leading to the second head section.
+
+\textbf{Generalizable lesson:} when an apparent search-and-replace
+covers multiple call sites of the same logic, \emph{open the second
+site and confirm} that the text matched. Identical-by-intent does not
+imply identical-by-character. A trailing comment, a missing newline,
+or different surrounding whitespace silently halves the replacement.
+
+\subsection{Resolution-mismatch effect on the trained head}
+
+The DSEC checkpoint was trained at $640 \times 430$, stride 8, giving
+an s3 grid of approximately $80 \times 54$. Initial deploy testing ran
+at $160 \times 120$ (25\% linear ROI on the DVXplorer's 640$\times$480
+sensor), giving an s3 grid of $20 \times 15$. The architecture itself
+is fully spatially translation-equivariant, but the head's
+\texttt{log\_w}, \texttt{log\_h} regression was trained on absolute
+pixel scales that no longer match: real objects at 25\% ROI appear
+4$\times$ smaller than the trained scale.
+
+Empirically:
+
+\begin{tabularx}{\linewidth}{lrrr}
+\toprule
+\textbf{Run-time input} & \textbf{max obj\_sigmoid} & \textbf{p99 obj\_sigmoid} & \textbf{obj\_logit range} \\
+\midrule
+$160 \times 120$ (25\% ROI)             & 0.015 & 0.011 & $[-17, -4]$ \\
+$640 \times 480$ (native, no ROI)       & 0.95  & 0.50  & $[-18, +3]$ \\
+\bottomrule
+\end{tabularx}
+
+The model is essentially unable to make a confident detection at
+$160 \times 120$ --- the head was never trained for that scale.
+
+\textbf{Rule:} for visual verification of a trained checkpoint, run at
+the trained input resolution. Re-cropping to a smaller window is a
+training-distribution change as severe as swapping the camera.
+
+% ====================================================================
+\section{Failed Experiments (Do Not Repeat)}
+
+The most valuable artifact of a careful optimization campaign is the
+list of attempts that didn't work. Each entry below was measured
+end-to-end and reverted.
+
+\subsection{TF32 Tensor Core for L4 \texttt{qvg} projection}
+
+Hypothesis: replace the per-event L4 \texttt{qvg} matvec
+(C1 = 24 $\to$ 3 $\cdot$ C2 = 144) with TF32
+\texttt{mma.sync.m16n8k4}, exploiting Ampere TC.
+
+Implementation: a prototype that pre-packs the \texttt{qvg} matrix into
+the m=16 format and dispatches the mma.sync instruction across a warp.
+
+Result: \textbf{P1 unchanged} (\texttt{max|}$\Delta$\texttt{|} = 4.20,
+TF32 precision is not a bottleneck for this network). \textbf{$-5\%$
+offline throughput}, \textbf{$-3\%$ live}.
+
+Root cause: the m=16 packing required dropping the 121 KB
+\texttt{qvgIn} smem cache to fit the TC operand buffer. The smem cache
+was worth more than the TC instruction.
+
+\textbf{Do not retry} without first eliminating the smem cache
+dependency (e.g.\ by re-pinning the cache in L2 instead of smem ---
+itself unverified).
+
+\subsection{Batch-local hidden-cell coalescing}
+
+Hypothesis: within a batch, group the (event, delta) tasks by target
+hidden cell, then load/store \texttt{h\_cell} once per group instead of
+once per task. The motivating observation was that nearby events
+often hit the same cell.
+
+Implementation: in the layer step, sort the task queue by cell id and
+fold repeats.
+
+Result: \textbf{P1 unchanged}. \textbf{$-6\%$ throughput}.
+
+Root cause: synthetic event distributions have reuse factor 1.097
+(barely above 1). The bookkeeping overhead (sort + coalesce) was
+700$\times$ the saving. The script
+\texttt{orin/analyze\_coalescing.py} is retained for re-running the
+analysis on real DVS camera streams where the reuse factor might
+differ, but the gating heuristic must be very high before this
+becomes worth the overhead.
+
+\subsection{Raising GPU occupancy to 2 blocks/SM}
+
+Hypothesis: doubling the number of CUDA blocks per SM (from 1 to 2)
+would hide memory latency and roughly double throughput.
+
+Measurement: 16-block layout at 96 registers/thread $\to$ 248 kev/s vs
+8-block baseline 227 kev/s. Gain: \textbf{$+1.1\times$, not the
+projected $+1.9\times$}.
+
+Root cause: the kernel is compute/memory-bound at saturation, not
+latency-bound. Both blocks fight for the same L2 bandwidth and the
+same scheduler slots. Pipeline-split variants (separate S2 and S3
+kernels, or 4-layer split kernels) hit the same wall.
+
+\textbf{Do not retry} as the headline path to higher throughput. Path
+past the current 230 kev/s ceiling likely requires:
+
+\begin{itemize}[itemsep=0pt]
+  \item a topological reorganization that reduces per-event work
+        (e.g.\ trading the BATCH$=$8 cell-owner partition for a
+        BATCH$=$4 with 2 blocks/SM at lower per-event smem),
+  \item channel reduction in L4--L7 via distillation,
+  \item or moving to a newer Jetson with more SMs.
+\end{itemize}
+
+\subsection{Single-linear head as a fused approximation of the trained head}
+
+Hypothesis: replace the (96 $\to$ 96 BN $\to$ SiLU $\to$ 96 $\to$ 7)
+trained head with a single linear (96 $\to$ 7) using the BN-fused conv
+matrix composed with the prediction matrix, treating SiLU as identity.
+
+Result: with the linearization, obj confidences during real motion
+stayed in the noise floor regardless of input scale --- the SiLU
+non-linearity is structural to the head's behaviour and cannot be
+dropped.
+
+Conclusion: trained-weight inference \emph{requires} a real 2-layer
+head on the GPU. Not approximable.
+
+% ====================================================================
+\section{Methodology: How To Optimize Without Wasting Time}
+\label{sec:methodology}
+
+The optimization rounds documented above all followed the same
+discipline. The discipline is the most portable lesson from this
+campaign.
+
+\subsection{P1 oracle is gate 0}
+
+Every kernel change must pass the P1 oracle
+(\texttt{bench\_s2\_s3\_head\_celled.py}) before any performance number
+is meaningful. The oracle compares \texttt{drain\_n} output against a
+single-thread CPU reference; tolerance is \texttt{max|}$\Delta$\texttt{|}
+$\leq 5.0$ on \texttt{s3\_feat} and \texttt{drift = 0} on drop counts.
+
+If P1 fails, stop benchmarking. A wrong answer at full speed is just
+noise.
+
+\subsection{Trust experiments, not projections}
+
+Every optimization estimate in this codebase has been off by
+2--10$\times$, almost always overestimating. The actual gains versus
+projections:
+
+\begin{tabularx}{\linewidth}{lXr}
+\toprule
+\textbf{Optimization} & & \textbf{Projection $\to$ actual} \\
+\midrule
+L4 \texttt{qvgIn} smem cache    & & $+20$--$30\%$ $\to$ $+4\%$ \\
+L7 L2 persistence               & & $+5$--$10\%$ $\to$ $+1.7\%$ offline, $0\%$ live \\
+Pipeline split / 2 blocks/SM    & & $+50$--$100\%$ $\to$ $+9\%$ then $+1.1\times$ at higher occupancy \\
+Balanced topology               & & $+20$--$30\%$ $\to$ $+4\%$ \\
+VG-only state-only patch        & & $+6$--$13\%$ $\to$ $+3\%$ \\
+TF32 TC at L4                   & & uncertain (expert promised gain) $\to$ $-5\%$ \\
+Batch-local hidden coalescing   & & uncertain (expert promised gain) $\to$ $-6\%$ \\
+\bottomrule
+\end{tabularx}
+
+\textbf{Rule:} for any proposed optimization, write the smallest patch
+that can deliver the gain, measure it, and only scale up if the
+measurement is within 2$\times$ of the projection. Otherwise, debug or
+abandon.
+
+\subsection{One change per commit}
+
+Bundling makes regressions hard to bisect. Each commit message records:
+
+\begin{itemize}[itemsep=0pt]
+  \item what changed (one sentence),
+  \item why it should help (one paragraph of analysis),
+  \item measured P1 result (drift, max$|\Delta|$),
+  \item measured perf result (throughput, latency),
+  \item revert decision if applicable.
+\end{itemize}
+
+\subsection{Save dead-end results}
+
+A negative result is more valuable than a missing measurement. The
+"failed experiments" section above only exists because the dead ends
+were written down at the time. The auto-memory entries
+\texttt{project\_tf32\_tc\_l4\_prototype}, \texttt{project\_coalescing\_net\_negative},
+and \texttt{project\_occupancy\_gives\_little} encode them as machine-readable
+notes that survive across conversations.
+
+% ====================================================================
+\section{Common Pitfalls and Footguns}
+
+A grab-bag of issues that bit us during this campaign and are worth
+documenting at the head of any future port.
+
+\subsection{NVRTC PTX cache: 80--115 s rebuild after kernel edit}
+
+The first compile of a kernel variant takes 80--115 seconds. Subsequent
+runs hit the cache in $\sim$0 s. The cache lives at
+\texttt{\~{}/.cache/openeva-orin-ptx/} (or
+\texttt{\~{}/.cache/openeva/orin\_ptx/}) and is keyed by the hash of the
+kernel source string. Editing the source --- even adding a comment ---
+changes the hash and forces a rebuild.
+
+Set \texttt{OPENEVA\_ORIN\_NO\_PTX\_CACHE=1} to skip the cache entirely
+(useful when verifying cache correctness or after suspected struct
+layout changes that didn't trigger an obvious rebuild).
+
+\subsection{\texttt{\_\_launch\_bounds\_\_(288, 1)} is mandatory for the celled kernel}
+
+NVRTC's default \texttt{MAX\_THREADS\_PER\_BLOCK} is 256. The celled
+kernel uses 9 warps $\times$ 32 = 288 threads. Without the explicit
+hint, \texttt{cuLaunchKernel} returns
+\texttt{LAUNCH\_OUT\_OF\_RESOURCES} (error 701).
+
+\subsection{\texttt{/tmp/ssla\_s\_*/} is volatile across reboots}
+
+Orin clears \texttt{/tmp} on reboot. If \texttt{hybrid\_runner} fails
+with "cannot open \texttt{/tmp/ssla\_s\_*/meta.json}", regenerate via
+\texttt{tools/make\_ssla\_stub.py} (stub) or
+\texttt{tools/convert\_dsec\_ckpt.py} (trained).
+
+\subsection{\texttt{kept} column includes pad duplicates in P1 bench}
+
+When the P1 oracle pads block ring sizes to a multiple of BATCH = 8,
+the duplicates pass through the kernel and inflate the \texttt{kept}
+count. Dedupe via global event index when comparing to the CPU
+reference.
+
+\subsection{\texttt{cv2.dnn.NMSBoxes} asserts \texttt{score\_threshold $\geq$ 0}}
+
+Already covered in \S 6.2. The dynamic threshold for top-K fallback can
+go slightly negative; clamp.
+
+\subsection{DVXplorer Micro contrast threshold valid range is 0--17}
+
+Already covered in \S 6.1. The getter does not reveal the silent clamp.
+
+% ====================================================================
+\section{Quick Reference}
+
+\subsection{Build}
+
+\begin{lstlisting}[language=Bash]
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+\end{lstlisting}
+
+Produces three shared libraries: \texttt{libstage01\_to\_gpu.so} (the
+production hybrid pipeline), \texttt{libstage01\_capi.so} (CPU-only
+baseline through \(L_3\)), \texttt{libstage0\_capi.so} (CPU-only
+through \(L_1\)).
+
+\subsection{Generate stub weights}
+
+\begin{lstlisting}[language=Bash]
+python3 tools/make_ssla_stub.py /tmp/ssla_s_64x80/ --h 64 --w 80
+\end{lstlisting}
+
+\subsection{Convert a trained checkpoint}
+
+\begin{lstlisting}[language=Bash]
+python3 tools/convert_dsec_ckpt.py \
+  /path/to/best_epoch=N-step=M.ckpt \
+  /tmp/ssla_s_dsec_480x640/ --h 480 --w 640
+\end{lstlisting}
+
+\subsection{P1 correctness gate}
+
+\begin{lstlisting}[language=Bash]
+cd orin
+python3 bench_s2_s3_head_celled.py --n 200000
+# expect: drift = 0, max|delta| <= 5
+\end{lstlisting}
+
+\subsection{Live run, synthetic source}
+
+\begin{lstlisting}[language=Bash]
+cd orin
+python3 hybrid_runner_multi.py \
+    --weights /tmp/ssla_s_64x80/ --h-full 64 --w-full 80 \
+    --gpu-blocks 8 --shards 6 \
+    --cpp-synth --synthetic-mev 2.0 --duration-s 8
+\end{lstlisting}
+
+\subsection{Live run, DVXplorer Micro, trained checkpoint}
+
+\begin{lstlisting}[language=Bash]
+cd orin
+python3 hybrid_runner_multi.py \
+    --weights /tmp/ssla_s_dsec_480x640/ --h-full 480 --w-full 640 \
+    --gpu-blocks 8 --shards 6 \
+    --roi-pct 100 --contrast 17 --cam-subsample EVERY_PIXEL \
+    --demo-display --display-fps 15 --display-scale 1 \
+    --obj-thresh 0.3 --nms-iou 0.65 \
+    --duration-s 60
+\end{lstlisting}
+
+\subsection{Repository layout (production-relevant only)}
+
+\begin{lstlisting}
+ssla-rt/
+  include/                       public C/C++ headers
+  src/lib_stage01_to_gpu.cpp     production hybrid pipeline (CPU s0+s1 -> ring -> GPU)
+  src/lib_stage01_capi.cpp       CPU-only stages 0+1
+  src/ssla_kernels.cpp           per-stage SSLA-S forward kernels (NEON-optimized)
+  tools/make_ssla_stub.py        random-weight stub generator
+  tools/convert_dsec_ckpt.py     DSEC ckpt -> deploy schema conversion
+  orin/orin/hybrid_common.py     ctypes struct mirrors, helpers
+  orin/orin/multi_block.py       per-block resource allocation + topology
+  orin/orin/weights_ssla.py      reshape ssla weights into matvec-friendly layout
+  orin/kernels/ssla_s2_s3_head_celled.cuh    PRODUCTION GPU kernel
+  orin/kernels/proto_layer_pair.cuh           warp-cooperative primitives
+  orin/hybrid_runner_multi.py    N-block production live runner
+  orin/bench_s2_s3_head_celled.py P1 oracle harness
+  orin/perf_celled_multi.py      offline throughput
+  docs/PIPELINE_DESIGN.md        canonical pipeline + constraints
+  docs/PROFILE.md                current measurements
+  docs/DEV_GUIDE.md              methodology playbook
+\end{lstlisting}
+
+% ====================================================================
+\section{Closing Notes}
+
+The system in its current state delivers $\sim$230 kev/s GPU drain and
+$\sim$330\,\(\mu\)s p50 end-to-end latency at saturation on Jetson Orin
+NX with stub weights, and runs the trained DSEC checkpoint end-to-end
+through the production kernel via a real 2-layer YOLOX head on the GPU.
+
+The remaining headroom is not on the CPU --- which already produces
+1.85--2.0 Mev/s, well above the 230 kev/s GPU ceiling --- but on the
+GPU side. The paths considered for breaking past 230 kev/s
+(higher occupancy, pipeline splitting, TF32 TC) all gave $\leq 1.1\times$ in
+measurement. A more invasive change (channel reduction via knowledge
+distillation, or a different topology that trades BATCH for blocks per
+SM) is the most plausible next direction. None of those are shipped.
+
+For visual verification of a trained checkpoint, always run at the
+trained input resolution; the head's \texttt{log\_w}, \texttt{log\_h}
+regression does not transfer across resolution.
+
+Everything in this handbook should be reproducible from the repo at
+the May 2026 head-of-line commit. The authoritative numbers live in
+\texttt{docs/PROFILE.md}, refreshed every measurement-bearing
+optimization commit.
+
+\end{document}
