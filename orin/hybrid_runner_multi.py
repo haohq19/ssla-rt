@@ -123,6 +123,17 @@ class CameraReader(threading.Thread):
 
         t0 = None
         H_full, W_full = self.args.h_full, self.args.w_full
+        # Translation: events inside the ROI crop are mapped to grid (0,0)
+        # origin. After translation + (optional) subsample, valid coord
+        # range is [0, W_full) × [0, H_full). Sanity check the user's
+        # configuration:
+        expected_w = roi_w // ds
+        expected_h = roi_h // ds
+        if expected_w != W_full or expected_h != H_full:
+            print(f"[cam] WARNING: ROI/subsample gives {expected_w}×{expected_h} "
+                  f"events but SSLA grid is {W_full}×{H_full}. "
+                  f"Set --h-full={expected_h} --w-full={expected_w} for a tight fit.",
+                  flush=True)
         while not self.stop_event.is_set():
             if not self.cam.isRunning():
                 time.sleep(0.001); continue
@@ -135,12 +146,14 @@ class CameraReader(threading.Thread):
             n = ev.size
             packed = np.empty((n, 4), dtype=np.float32, order="C")
             packed[:, 0] = (ev["timestamp"] - t0).astype(np.float32)
-            packed[:, 1] = (ev["x"].astype(np.int32) // ds).astype(np.float32)
-            packed[:, 2] = (ev["y"].astype(np.int32) // ds).astype(np.float32)
+            # Translate to ROI origin then (optionally) subsample.
+            packed[:, 1] = ((ev["x"].astype(np.int32) - roi_x) // ds).astype(np.float32)
+            packed[:, 2] = ((ev["y"].astype(np.int32) - roi_y) // ds).astype(np.float32)
             packed[:, 3] = ev["polarity"].astype(np.float32)
-            # Drop events that fall outside the H_full × W_full grid
-            # (e.g., if the sensor returns coords past our SSLA grid after
-            # subsampling). These would otherwise hit OOB cells.
+            # Defensive clip: drop anything that landed outside grid (the
+            # camera's setCropArea should make this empty when configured
+            # correctly, but stragglers can appear during the brief window
+            # before the chip applies the crop).
             valid = ((packed[:, 1] >= 0) & (packed[:, 1] < W_full) &
                      (packed[:, 2] >= 0) & (packed[:, 2] < H_full))
             if not valid.all():
@@ -170,14 +183,22 @@ def main():
     ap.add_argument("--contrast", type=int, default=17,
                     help="DVXplorer contrast threshold ON/OFF (clamped to 0-17; "
                          "chip silently clamps above 17 — see DEV_GUIDE §6.2)")
-    ap.add_argument("--cam-subsample", type=str, default="EVERY_EIGHTH",
+    ap.add_argument("--cam-subsample", type=str, default="EVERY_PIXEL",
                     choices=["EVERY_PIXEL", "EVERY_SECOND",
                              "EVERY_FOURTH", "EVERY_EIGHTH"],
-                    help="Chip-side subsample factor (1/2/4/8 x). Default 8x "
-                         "matches the 640×480 sensor → 80×60 grid mapping.")
+                    help="Chip-side subsample factor (1/2/4/8 x). Default is "
+                         "EVERY_PIXEL — events at the camera ROI's native "
+                         "resolution. If you want the chip to subsample, pass "
+                         "EVERY_SECOND/FOURTH/EIGHTH and pick --h-full / "
+                         "--w-full accordingly.")
     ap.add_argument("--roi-pct", type=float, default=100.0,
-                    help="Centered crop to N%% × N%% of sensor (linear, both "
-                         "dims). 100 = full sensor. 50 = 25%% area, etc.")
+                    help="Centered crop to N%% × N%% of sensor (LINEAR, both "
+                         "dims). 100 = full sensor. 25 = 25%%×25%% linear = "
+                         "6.25%% of sensor area. Events inside the crop are "
+                         "translated so the ROI origin maps to grid (0,0); "
+                         "this means --h-full and --w-full must match the "
+                         "ROI-and-subsample-derived grid size, NOT the full "
+                         "sensor.")
     ap.add_argument("--cam-interval-us", type=int, default=2000,
                     help="DVXplorer batch interval (µs). Lower = lower latency, "
                          "more frequent small batches.")
