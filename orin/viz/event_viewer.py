@@ -65,7 +65,13 @@ READOUT_FPS_LADDER = [
     ("clos-10k", RF.CONSTANT_LOSSY_10000),
 ]
 
-CONTRAST_MAX     = 200
+# DVXplorer chip-level valid range for setContrastThresholdOn/Off is 0-17
+# (default 9). Values > 17 are silently clamped to 17 by the chip firmware,
+# even though the dv-processing getter dutifully returns whatever was passed
+# in. So setting threshold = 18 or 200 produces identical event rates — the
+# chip is running at 17 in both cases. Cap the trackbar accordingly.
+# Source: iniVation dv-users mailing list + dv-processing docs.
+CONTRAST_MAX     = 17
 RATE_BIN_MS      = 50
 RATE_HISTORY_S   = 10.0
 STRIP_H          = 150
@@ -301,7 +307,8 @@ class EventDrainer(threading.Thread):
 
 
 def probe_thresholds(cam, dwell_s=1.5):
-    candidates = [1, 5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560]
+    # Chip-level valid range is 0-17; values above 17 are silently clamped.
+    candidates = [0, 1, 2, 4, 6, 8, 10, 12, 14, 17]
     print(f"Probing contrast thresholds, dwell={dwell_s}s each.")
     print(f"{'threshold':>10} | {'rate Mev/s':>12} | result")
     for v in candidates:
@@ -408,8 +415,9 @@ def main() -> int:
                          "front of the camera. Compares rates under one "
                          "consistent motion. Pairs with --motion-probe-* below.")
     ap.add_argument("--motion-probe-thresholds", type=str,
-                    default="5,8,10,12,15,20,30,50",
-                    help="Comma-separated list (default: 5,8,10,12,15,20,30,50)")
+                    default="2,4,6,8,10,12,14,17",
+                    help="Comma-separated list (default: 2,4,6,8,10,12,14,17). "
+                         "Chip clamps above 17 — values >17 do nothing.")
     ap.add_argument("--motion-probe-dwell-s", type=float, default=3.0,
                     help="Seconds to hold each threshold (default: 3.0)")
     ap.add_argument("--list-methods", action="store_true")
